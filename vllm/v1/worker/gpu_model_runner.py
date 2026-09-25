@@ -594,6 +594,14 @@ class GPUModelRunner(
                 | Step3p5MTPProposer
             )
             if self.speculative_config.use_disagg():
+                from vllm.v1.spec_decode.multimodal import (
+                    validate_pilot_compatibility,
+                )
+
+                validate_pilot_compatibility(
+                    self.model_config,
+                    self.speculative_config.draft_model_config,
+                )
                 # Disagg uses a remote draft worker over ZMQ; no local
                 # drafter is loaded on the verify side. Must short-circuit
                 # before any method-specific branch since disagg can
@@ -1303,6 +1311,7 @@ class GPUModelRunner(
                 prompt_token_ids=new_req_data.prompt_token_ids,
                 prompt_embeds=new_req_data.prompt_embeds,
                 prompt_is_token_ids=new_req_data.prompt_is_token_ids,
+                disagg_mm_envelope=new_req_data.disagg_mm_envelope,
                 mm_features=new_req_data.mm_features,
                 sampling_params=sampling_params,
                 pooling_params=pooling_params,
@@ -4208,6 +4217,8 @@ class GPUModelRunner(
         ):
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            if self.supports_mm_inputs:
+                self._disagg_start_multimodal_prefill(scheduler_output)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -4441,6 +4452,23 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.use_disagg()
+            ):
+                from vllm.v1.spec_decode.disagg_draft_trace import (
+                    start_cuda_timer,
+                    trace_enabled,
+                )
+
+                if trace_enabled():
+                    from vllm.distributed.parallel_state import get_tp_group
+
+                    if get_tp_group().rank_in_group == 0:
+                        self._disagg_trace_target_verify = {
+                            "cuda_start": start_cuda_timer(),
+                            "execution_mode": str(cudagraph_mode),
+                        }
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4741,6 +4769,35 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
             )
 
+        trace_target = getattr(self, "_disagg_trace_target_verify", None)
+        if trace_target is not None:
+            from vllm.v1.spec_decode.disagg_draft_trace import (
+                finish_cuda_timer,
+                trace_event,
+            )
+
+            verification_latency_ms = finish_cuda_timer(trace_target["cuda_start"])
+            trace_event(
+                "target",
+                "verification",
+                request_ids=req_ids_output_copy,
+                proposed_token_ids=[
+                    scheduler_output.scheduled_spec_decode_tokens.get(rid, [])
+                    for rid in req_ids_output_copy
+                ],
+                verified_token_ids=valid_sampled_token_ids,
+                accepted_counts=[
+                    max(len(ids) - 1, 0) for ids in valid_sampled_token_ids
+                ],
+                bonus_tokens=[
+                    ids[-1] if ids else None for ids in valid_sampled_token_ids
+                ],
+                execution_mode=trace_target["execution_mode"],
+                cuda_elapsed_ms=verification_latency_ms,
+                verification_latency_ms=verification_latency_ms,
+            )
+            self._disagg_trace_target_verify = None
+
         if draft_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
@@ -4912,6 +4969,45 @@ class GPUModelRunner(
     # (which uses the CPU list-of-lists ``valid_sampled_token_ids``).
     # ------------------------------------------------------------------
 
+    def _get_disagg_speculator(self) -> Any:
+        if not hasattr(self, "_disagg_speculator"):
+            from vllm.distributed.parallel_state import get_tp_group
+            from vllm.v1.worker.gpu.spec_decode import init_speculator
+
+            tp_rank = get_tp_group().rank_in_group
+            self._disagg_tp_rank = tp_rank
+            self._disagg_speculator = None
+            if tp_rank == 0:
+                self._disagg_speculator = init_speculator(
+                    self.vllm_config,
+                    self.device,
+                )
+        return self._disagg_speculator
+
+    def _disagg_start_multimodal_prefill(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        spec_config = self.speculative_config
+        if spec_config is None or not spec_config.use_disagg():
+            return
+        mm_req_ids = [
+            req.req_id
+            for req in scheduler_output.scheduled_new_reqs
+            if req.disagg_mm_envelope is not None and req.prompt_token_ids is not None
+        ]
+        if not mm_req_ids:
+            return
+        speculator = self._get_disagg_speculator()
+        if speculator is None or not speculator.is_connected or speculator._is_eagle:
+            return
+        for rid in mm_req_ids:
+            req = self.requests[rid]
+            assert req.prompt_token_ids is not None
+            speculator.cache_new_request_tokens(rid, req.prompt_token_ids)
+            assert req.disagg_mm_envelope is not None
+            speculator.cache_new_request_multimodal(rid, req.disagg_mm_envelope)
+        speculator.start_multimodal_prefill(mm_req_ids)
+
     def _disagg_propose_drafts_early(
         self,
         sampler_output: SamplerOutput,
@@ -4925,21 +5021,7 @@ class GPUModelRunner(
         None on error / non-rank-0 / no active speculator."""
         num_reqs = self.input_batch.num_reqs
 
-        # Lazy speculator init — identical to _disagg_propose_drafts()
-        if not hasattr(self, "_disagg_speculator"):
-            from vllm.distributed.parallel_state import get_tp_group
-            from vllm.v1.worker.gpu.spec_decode import init_speculator
-
-            tp_rank = get_tp_group().rank_in_group
-            self._disagg_tp_rank = tp_rank
-            self._disagg_speculator = None
-            if tp_rank == 0:
-                self._disagg_speculator = init_speculator(
-                    self.vllm_config,
-                    self.device,
-                )
-
-        speculator = self._disagg_speculator
+        speculator = self._get_disagg_speculator()
         if speculator is None or not speculator.is_connected:
             return None
 
@@ -4965,6 +5047,8 @@ class GPUModelRunner(
                     :n_prompt,
                 ].tolist()
                 speculator.cache_new_request_tokens(rid, prompt_ids)
+                if req.disagg_mm_envelope is not None:
+                    speculator.cache_new_request_multimodal(rid, req.disagg_mm_envelope)
 
         # Build GPU-native num_sampled / last_sampled from the sampler
         # output tensor. sampled_token_ids is [num_reqs, max_gen_len]
@@ -5168,21 +5252,7 @@ class GPUModelRunner(
         """
         num_reqs = self.input_batch.num_reqs
 
-        # Lazily create the speculator proxy on first use (TP rank 0 only).
-        if not hasattr(self, "_disagg_speculator"):
-            from vllm.distributed.parallel_state import get_tp_group
-            from vllm.v1.worker.gpu.spec_decode import init_speculator
-
-            tp_rank = get_tp_group().rank_in_group
-            self._disagg_tp_rank = tp_rank
-            self._disagg_speculator = None
-            if tp_rank == 0:
-                self._disagg_speculator = init_speculator(
-                    self.vllm_config,
-                    self.device,
-                )
-
-        speculator = self._disagg_speculator
+        speculator = self._get_disagg_speculator()
         if speculator is not None and speculator.is_connected:
             # Cache prompt tokens for new requests so the speculator's
             # prefill path can send them to the draft server without

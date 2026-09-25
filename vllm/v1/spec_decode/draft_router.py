@@ -36,9 +36,8 @@ class DraftRouter:
 
     Args:
         connectors: Pre-built ``DraftConnector`` instances, one per
-            Draft_Server.  Connector creation (NCCL process groups,
-            ZMQ sockets, etc.) is handled externally by the speculator
-            proxy.
+            Draft_Server. Connector creation and ZMQ/CUDA IPC setup are
+            handled externally by the speculator proxy.
         draft_server_addresses: Addresses of the Draft_Servers, kept
             for logging / diagnostics.  Order must match *connectors*.
         policy: Load-balancing policy. One of ``_SUPPORTED_POLICIES``.

@@ -27,6 +27,10 @@ import prometheus_client
 import torch
 
 from vllm import envs
+from vllm.inputs import TextPrompt
+from vllm.inputs.preprocess import InputPreprocessor
+from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.multimodal.utils import argsort_mm_positions
 from vllm.v1.spec_decode.draft_connector import (
     _str_to_dtype,
 )
@@ -35,6 +39,7 @@ from vllm.v1.spec_decode.draft_data_models import (
     FreeSeqRequest,
     IpcHandshake,
     IpcHandshakeAck,
+    PrefillReady,
     PrefillRequest,
     VerificationOutcome,
     decode,
@@ -48,6 +53,7 @@ from vllm.v1.spec_decode.draft_server_mixins import (
     DraftServerSpeculateMixin,
     DraftServerTransportMixin,
 )
+from vllm.v1.spec_decode.multimodal import validate_pilot_compatibility
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +196,7 @@ class _DraftServerIpcPeer:
         K: int,
         n_slots: int,
         gpu_bufs: dict[str, torch.Tensor],
+        draft_device: torch.device,
     ) -> None:
         self.verify_server_id = verify_server_id
         self.shm_path = shm_path
@@ -234,6 +241,14 @@ class _DraftServerIpcPeer:
             max_batch,
             dtype=torch.int64,
             pin_memory=True,
+        )
+        self._seq_ids_gpu = torch.empty(
+            n_slots, max_batch, dtype=torch.int64, device=draft_device
+        )
+        self._k_accepted_gpu = torch.empty_like(self._seq_ids_gpu)
+        self._bonus_tokens_gpu = torch.empty_like(self._seq_ids_gpu)
+        self._temperatures_gpu = torch.empty(
+            n_slots, max_batch, dtype=torch.float32, device=draft_device
         )
         # Dedicated side stream for the poll D2H and seq_ids H2D/D2H.
         # Using the default stream serializes with cache_build kernels;
@@ -309,6 +324,7 @@ class DraftServer(
         # Disagg-specific config
         self.fan_out = spec_config.disagg_fan_out
         self.saguaro_c = spec_config.disagg_saguaro_c
+        self.uniform_fanout = spec_config.disagg_uniform_fanout
         self.jit_fallback = spec_config.disagg_jit_fallback
 
         # Parallel fanout: use single-pass MTP-style drafting when the
@@ -324,7 +340,8 @@ class DraftServer(
                 "Llama-3 + one appended mask token)."
             )
 
-        # SSD §4.3 fast-backup: on cache miss, return zero drafts to
+        # SSD §4.3 fast-backup: without JIT fallback, cache misses return
+        # a bonus token followed by placeholders to the verifier
         # the verifier (saves the full ~17 ms K-step JIT) and let
         # cache_build seed real cache entries by running ONE
         # glue_decode per miss row using the bonus token. Per-round
@@ -355,6 +372,7 @@ class DraftServer(
         # ----- Existing draft-side components -----
         # Initialized by load_model() which must be called before serve().
         self.draft_model_runner: Any = None  # DraftModelRunner
+        self.draft_input_preprocessor: InputPreprocessor | None = None
         self.cache: Any = None  # SpeculationCache
         self.outcome_predictor: Any = None  # OutcomePredictor
         self.saguaro_sampler: Any = None  # SaguaroSampler
@@ -543,6 +561,8 @@ class DraftServer(
         Must be called before :meth:`serve`.  Mirrors the initialization
         done by ``DisaggDraftWorker.__init__`` + ``load_model()``.
         """
+        from copy import deepcopy
+
         from vllm.v1.worker.gpu.spec_decode.disagg_draft.draft_model_runner import (
             DraftModelRunner,
         )
@@ -587,6 +607,7 @@ class DraftServer(
             acceptance_rate=0.65,
             power_law_exponent=1.5,
             device=self.device,
+            uniform_fanout=self.uniform_fanout,
         )
 
         # --- Initialize SaguaroSampler ---
@@ -603,6 +624,18 @@ class DraftServer(
             device=self.device,
         )
         self.draft_model_runner.load_model()
+        if validate_pilot_compatibility(
+            self.vllm_config.model_config,
+            self.vllm_config.speculative_config.draft_model_config,
+        ):
+            draft_vllm_config = deepcopy(self.vllm_config)
+            draft_vllm_config.model_config = (
+                self.vllm_config.speculative_config.draft_model_config
+            )
+            draft_mm_config = draft_vllm_config.model_config.multimodal_config
+            assert draft_mm_config is not None
+            draft_mm_config.mm_processor_cache_gb = 0
+            self.draft_input_preprocessor = InputPreprocessor(draft_vllm_config)
         logger.info(
             "DraftServer model loaded: K=%d, vocab=%d, device=%s",
             self.K,
@@ -981,7 +1014,8 @@ class DraftServer(
                 torch.profiler.ProfilerActivity.CUDA,
             ],
             record_shapes=False,
-            with_stack=True,
+            with_stack=os.environ.get("VLLM_DRAFT_TORCH_PROFILER_WITH_STACK", "1")
+            != "0",
         )
         self._profiler.__enter__()
         logger.info("DraftServer profile started; output dir=%s", prof_dir)
@@ -1131,6 +1165,7 @@ class DraftServer(
 
                 if runner is not None:
                     runner.free_blocks(internal_sid)
+                    runner.free_multimodal_state(internal_sid)
 
                 self._request_state.pop((_vs_id, ext_seq_id), None)
 
@@ -1185,47 +1220,118 @@ class DraftServer(
             key,
         )
 
-        prompt_token_ids = self._recv_tensor(
-            prefill.prompt_token_ids_ref.shape,
-            _str_to_dtype(prefill.prompt_token_ids_ref.dtype),
-        )
-
-        seq_id = self._map_seq_id(verify_server_id, prefill.seq_id)
-        num_tokens = torch.tensor(
-            [prompt_token_ids.shape[0]],
-            dtype=torch.int64,
-            device=self.device,
-        )
-        seq_ids = torch.tensor(
-            [seq_id],
-            dtype=torch.int64,
-            device=self.device,
-        )
-
-        logger.info(
-            "DraftServer prefill: seq_id=%d, num_tokens=%d",
-            seq_id,
-            int(num_tokens[0].item()),
-        )
-
-        runner = self.draft_model_runner
-        if runner is None or not runner._model_loaded:
-            return
-
-        try:
-            runner.prefill(
-                input_ids=prompt_token_ids,
-                num_tokens_per_seq=num_tokens,
-                seq_ids=seq_ids,
+        with torch.profiler.record_function("draft_prefill: receive"):
+            prompt_token_ids = self._recv_tensor(
+                prefill.prompt_token_ids_ref.shape,
+                _str_to_dtype(prefill.prompt_token_ids_ref.dtype),
             )
+
+        is_multimodal = prefill.mm_image_refs is not None
+        try:
+            if is_multimodal:
+                if self.draft_input_preprocessor is None or prefill.mm_prompt is None:
+                    raise RuntimeError("Missing multimodal draft processor or prompt")
+                if not isinstance(prefill.mm_prompt, str):
+                    raise RuntimeError("Multimodal pilot requires a text prompt")
+                with torch.profiler.record_function("draft_prefill: media_processor"):
+                    images = [
+                        self._recv_tensor(ref.shape, _str_to_dtype(ref.dtype)).cpu()
+                        for ref in prefill.mm_image_refs
+                    ]
+                    draft_inputs = self.draft_input_preprocessor.preprocess(
+                        TextPrompt(
+                            prompt=prefill.mm_prompt,
+                            multi_modal_data={"image": images},
+                            mm_processor_kwargs=prefill.mm_processor_kwargs or {},
+                        )
+                    )
+                if draft_inputs["type"] != "multimodal":
+                    raise RuntimeError("Draft processor did not produce MM inputs")
+                draft_prompt_token_ids = draft_inputs["prompt_token_ids"]
+                draft_mm_features = [
+                    MultiModalFeatureSpec(
+                        data=draft_inputs["mm_kwargs"][modality][index],
+                        modality=modality,
+                        identifier=draft_inputs["mm_hashes"][modality][index],
+                        mm_position=draft_inputs["mm_placeholders"][modality][index],
+                        mm_hash=draft_inputs["mm_hashes"][modality][index],
+                    )
+                    for modality, index in argsort_mm_positions(
+                        draft_inputs["mm_placeholders"]
+                    )
+                ]
+
+            seq_id = self._map_seq_id(verify_server_id, prefill.seq_id)
+            if is_multimodal:
+                prompt_token_ids = torch.tensor(
+                    draft_prompt_token_ids,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            num_tokens = torch.tensor(
+                [prompt_token_ids.shape[0]], dtype=torch.int64, device=self.device
+            )
+            seq_ids = torch.tensor([seq_id], dtype=torch.int64, device=self.device)
+            logger.info(
+                "DraftServer prefill: seq_id=%d, num_tokens=%d",
+                seq_id,
+                int(num_tokens[0].item()),
+            )
+            runner = self.draft_model_runner
+            if runner is None or not runner._model_loaded:
+                raise RuntimeError("Draft model is not loaded")
+            if is_multimodal:
+                with torch.profiler.record_function("draft_prefill: model"):
+                    runner.multimodal_prefill(
+                        input_ids=prompt_token_ids,
+                        num_tokens_per_seq=num_tokens,
+                        seq_ids=seq_ids,
+                        mm_features=draft_mm_features,
+                    )
+            else:
+                runner.prefill(
+                    input_ids=prompt_token_ids,
+                    num_tokens_per_seq=num_tokens,
+                    seq_ids=seq_ids,
+                )
         except (RuntimeError, ValueError) as e:
-            logger.warning("DraftServer prefill failed: %s", e)
+            if not is_multimodal:
+                logger.warning("DraftServer prefill failed: %s", e)
+                return
+            ready = PrefillReady(
+                request_id=prefill.request_id or "",
+                cache_generation=prefill.cache_generation,
+                error=str(e),
+            )
+            await self._socket.send_multipart(
+                [identity, encode(DraftCommand("PREFILL_READY", encode(ready)))]
+            )
+            return
+        except Exception as e:
+            if not is_multimodal:
+                raise
+            ready = PrefillReady(
+                request_id=prefill.request_id or "",
+                cache_generation=prefill.cache_generation,
+                error=str(e),
+            )
+            await self._socket.send_multipart(
+                [identity, encode(DraftCommand("PREFILL_READY", encode(ready)))]
+            )
             return
 
         # Clear stale round state for freshly prefilled sequences.
         for sid in seq_ids.tolist():
             self._round_base_lens.pop(int(sid), None)
             self._swap_states.pop(int(sid), None)
+        if is_multimodal:
+            ready = PrefillReady(
+                request_id=prefill.request_id or "",
+                cache_generation=prefill.cache_generation,
+            )
+            await self._socket.send_multipart(
+                [identity, encode(DraftCommand("PREFILL_READY", encode(ready)))]
+            )
 
     async def _handle_free_seq(
         self,
@@ -1235,8 +1341,7 @@ class DraftServer(
     ) -> None:
         """Handle FREE_SEQ command to release resources.
 
-        Receives the seq_ids tensor via NCCL (matching the send order
-        in ``ZmqDraftConnector.send_free_seq``), then for each
+        Receives the seq_ids tensor in the ZMQ multipart request, then for each
         seq_id: frees KV cache blocks, clears speculation cache entries,
         and unregisters the request.
 
@@ -1272,6 +1377,7 @@ class DraftServer(
 
             if runner is not None:
                 runner.free_blocks(sid)
+                runner.free_multimodal_state(sid)
                 freed += 1
 
             # Unregister the request. _register_request was called in
@@ -1371,6 +1477,7 @@ class DraftServer(
                 K=handshake.K,
                 n_slots=handshake.n_slots,
                 gpu_bufs=gpu_bufs,
+                draft_device=self.device,
             )
             # If a previous IPC session existed for this VS (e.g. after a
             # reconnect), close the stale peer first.
@@ -1555,37 +1662,17 @@ class DraftServer(
                 mapped = self._map_seq_id(verify_server_id, int(ext))
                 internal_ids.append(mapped)
                 remap_view[i] = mapped
-            # Allocate + write on the DEFAULT stream so the caching
-            # allocator tags the tensor's owning stream to match its
-            # downstream consumers (cache.lookup runs on the default
-            # stream). A previous version wrote this on
-            # ``peer._poll_stream`` while allocating on the default
-            # stream; that stream/allocator mismatch surfaced under
-            # multi-VS merged load as a spurious device-side assert
-            # (masked when CUDA_LAUNCH_BLOCKING=1). Pinned source keeps
-            # the copy non-blocking on the default stream.
-            seq_ids = torch.empty(
-                B,
-                dtype=torch.int64,
-                device=self.device,
-            )
+            # Write into the per-slot stable buffers on the default stream.
+            # Pinned source keeps the remap copy non-blocking.
+            seq_ids = peer._seq_ids_gpu[slot, :B]
             seq_ids.copy_(remap_view, non_blocking=True)
 
-            k_accepted = buf["req_k_accepted"][slot, :B].to(
-                device=self.device,
-                non_blocking=True,
-                copy=True,
-            )
-            bonus_tokens = buf["req_bonus_tokens"][slot, :B].to(
-                device=self.device,
-                non_blocking=True,
-                copy=True,
-            )
-            temperatures = buf["req_temperatures"][slot, :B].to(
-                device=self.device,
-                non_blocking=True,
-                copy=True,
-            )
+            k_accepted = peer._k_accepted_gpu[slot, :B]
+            bonus_tokens = peer._bonus_tokens_gpu[slot, :B]
+            temperatures = peer._temperatures_gpu[slot, :B]
+            k_accepted.copy_(k_accepted_ring, non_blocking=True)
+            bonus_tokens.copy_(buf["req_bonus_tokens"][slot, :B], non_blocking=True)
+            temperatures.copy_(buf["req_temperatures"][slot, :B], non_blocking=True)
 
             # Synthesize a VerificationOutcome for the inner handler.
             # The refs are unused when preloaded_tensors is provided.

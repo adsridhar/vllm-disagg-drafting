@@ -34,6 +34,12 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import (
+    supports_mrope,
+    supports_multimodal,
+)
+from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.v1.spec_decode.utils import (
     eagle_step_update_slot_mapping_and_metadata,
 )
@@ -88,6 +94,7 @@ class DraftModelRunner(
         self.max_model_len = self.draft_config.max_model_len
         self._num_spec_tokens = spec_config.num_speculative_tokens
         self._is_eagle = spec_config.method == "eagle"
+        self._uses_mrope = self.draft_config.uses_mrope
         # Total geometric fan-out budget per sequence (matches the
         # OutcomePredictor's total_budget on the server side). Used by
         # the CUDA graph capture mixin to size graphs for parallel
@@ -142,6 +149,9 @@ class DraftModelRunner(
             self.max_num_blocks,
             dtype=torch.int32,
             device=device,
+        )
+        self._mrope_position_deltas_gpu = torch.zeros(
+            self._block_table_gpu.shape[0], dtype=torch.long, device=device
         )
         # Pre-allocated tensors for decode_step (avoid per-call alloc)
         self._decode_query_start_loc = torch.arange(
@@ -339,6 +349,67 @@ class DraftModelRunner(
         logits, _ = self.decode_step(tokens, positions, seq_ids)
         return logits
 
+    def _model_positions(
+        self,
+        positions: torch.Tensor,
+        seq_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self._uses_mrope:
+            return positions
+        deltas = self._mrope_position_deltas_gpu[seq_ids.to(torch.long)]
+        continuation_positions = positions + deltas
+        return continuation_positions.unsqueeze(0).expand(3, -1)
+
+    def free_multimodal_state(self, seq_id: int) -> None:
+        self._mrope_position_deltas_gpu[seq_id] = 0
+
+    @torch.inference_mode()
+    def jit_propose(
+        self,
+        bonus_tokens: torch.Tensor,
+        seq_ids: torch.Tensor,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Greedily generate draft tokens for cache-miss rows.
+
+        Args:
+            bonus_tokens: [B] target bonus tokens at the current position.
+            seq_ids: [B] sequence IDs for the miss rows.
+            num_tokens: Number of speculative tokens to generate.
+
+        Returns:
+            The generated token IDs and their logits, each with ``num_tokens``
+            positions.
+        """
+        batch_size = bonus_tokens.shape[0]
+        draft_tokens = torch.empty(
+            batch_size,
+            num_tokens,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        draft_logits = torch.empty(
+            batch_size,
+            num_tokens,
+            self.vocab_size,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        positions = torch.tensor(
+            [self._seq_lens.get(int(seq_id), 0) for seq_id in seq_ids.tolist()],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        input_ids = bonus_tokens.to(torch.int32)
+        for index in range(num_tokens):
+            logits, _ = self.decode_step(input_ids, positions, seq_ids)
+            next_tokens = logits.argmax(dim=-1)
+            draft_tokens[:, index] = next_tokens
+            draft_logits[:, index] = logits
+            input_ids = next_tokens.to(torch.int32)
+            positions += 1
+        return draft_tokens, draft_logits
+
     def tree_decode_step(
         self,
         input_ids: torch.Tensor,
@@ -359,6 +430,7 @@ class DraftModelRunner(
         """
         assert self._model_loaded
         N = input_ids.shape[0]
+        model_positions = self._model_positions(positions, seq_ids_expanded)
 
         # Compute slot mapping from per-branch block tables
         logical_blocks = (positions // self.block_size).to(torch.int64)
@@ -386,13 +458,13 @@ class DraftModelRunner(
             g = self._tree_graphs[graph_n]
             # Copy inputs into graph's pre-allocated buffers (pad to graph_n)
             g["input_ids"][:N].copy_(input_ids)
-            g["positions"][:N].copy_(positions)
+            g["positions"][..., :N].copy_(model_positions)
             g["slot_mapping"][:N].copy_(slot_mapping)
             g["seq_lens"][:N].copy_(seq_lens_i32)
             # Pad extra slots with safe values (seq_len=1, slot=0)
             if graph_n > N:
                 g["input_ids"][N:graph_n].zero_()
-                g["positions"][N:graph_n].zero_()
+                g["positions"][..., N:graph_n].zero_()
                 g["slot_mapping"][N:graph_n].zero_()
                 g["seq_lens"][N:graph_n].fill_(1)
             g["block_tables"][:N].copy_(block_tables[:N])
@@ -432,7 +504,7 @@ class DraftModelRunner(
             ):
                 hidden_states = self.model(
                     input_ids=input_ids,
-                    positions=positions,
+                    positions=model_positions,
                 )
 
         # Compute logits
@@ -488,9 +560,7 @@ class DraftModelRunner(
             draft_vllm_config.compilation_config = deepcopy(
                 self.vllm_config.compilation_config
             )
-            draft_vllm_config.compilation_config.cudagraph_mode = (
-                CUDAGraphMode.NONE
-            )
+            draft_vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
             draft_vllm_config.compilation_config.cudagraph_capture_sizes = []
             draft_vllm_config.compilation_config.max_cudagraph_capture_size = 0
         else:
@@ -590,6 +660,16 @@ class DraftModelRunner(
             # Callers fall through to the per-layer eager loop when the
             # graph dict is empty (see ``run_kv_copy``).
             self._kv_copy_graphs = {}
+
+        from vllm.v1.spec_decode.disagg_draft_trace import trace_event
+
+        trace_event(
+            "draft",
+            "execution_mode",
+            decode="cuda_graph" if self._decode_graphs_captured else "eager",
+            tree_decode="cuda_graph" if self._tree_decode_captured else "eager",
+            kv_copy="cuda_graph" if self._kv_copy_graphs else "eager",
+        )
 
     def _warmup_eagle(self) -> None:
         """Compile and warm EAGLE before the draft server accepts requests."""
@@ -695,8 +775,7 @@ class DraftModelRunner(
         lm_head.weight_loader(lm_head.weight, lm_head_weight)
         self.model.lm_head = lm_head
         logger.info(
-            "Loaded target embedding and lm_head for standalone EAGLE "
-            "from %s and %s.",
+            "Loaded target embedding and lm_head for standalone EAGLE from %s and %s.",
             embedding_shard,
             lm_head_shard,
         )
@@ -720,12 +799,15 @@ class DraftModelRunner(
         next_token_ids: torch.Tensor,
         seq_ids: torch.Tensor,
         return_trace: bool = False,
-    ) -> torch.Tensor | tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
+    ) -> (
+        torch.Tensor
+        | tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]
+    ):
         """Generate K EAGLE tokens from one packed target-model query."""
         assert self._is_eagle and self._model_loaded
         assert self.model is not None
@@ -868,9 +950,7 @@ class DraftModelRunner(
                     attn_metadata=attn_metadata,
                     vllm_config=self._draft_vllm_config,
                     num_tokens=B,
-                    slot_mapping=self._build_slot_mapping_dict(
-                        decode_slot_mapping
-                    ),
+                    slot_mapping=self._build_slot_mapping_dict(decode_slot_mapping),
                     batch_descriptor=BatchDescriptor(num_tokens=B),
                 ),
                 self._ir_priority_ctx(),
@@ -906,9 +986,7 @@ class DraftModelRunner(
             attn_metadata = self._build_flash_attn_metadata(
                 num_tokens=B,
                 seq_lens_tensor=seq_lens,
-                max_seq_len=max(last_positions_list)
-                + self._num_spec_tokens
-                + 1,
+                max_seq_len=max(last_positions_list) + self._num_spec_tokens + 1,
                 max_query_len=1,
                 query_start_loc=decode_query_start,
                 block_table=block_tables,
@@ -919,9 +997,7 @@ class DraftModelRunner(
                     attn_metadata=attn_metadata,
                     vllm_config=self._draft_vllm_config,
                     num_tokens=B,
-                    slot_mapping=self._build_slot_mapping_dict(
-                        decode_slot_mapping
-                    ),
+                    slot_mapping=self._build_slot_mapping_dict(decode_slot_mapping),
                     batch_descriptor=BatchDescriptor(num_tokens=B),
                 ),
                 self._ir_priority_ctx(),
@@ -930,7 +1006,7 @@ class DraftModelRunner(
                     input_ids=token.to(torch.int32),
                     positions=current_positions,
                     hidden_states=feedback_hidden,
-            )
+                )
             final_logits_hidden, final_feedback = final_output
             assert outcome_logits is not None
             assert feedback_trace is not None
@@ -941,9 +1017,7 @@ class DraftModelRunner(
 
         tracked_extra = 1 if return_trace else 0
         for sid, last_position in zip(seq_ids_list, last_positions_list):
-            self._seq_lens[sid] = (
-                last_position + self._num_spec_tokens + tracked_extra
-            )
+            self._seq_lens[sid] = last_position + self._num_spec_tokens + tracked_extra
         if return_trace:
             assert outcome_logits is not None
             assert feedback_trace is not None
@@ -981,9 +1055,7 @@ class DraftModelRunner(
             logical_blocks = (positions // self.block_size).to(torch.int64)
             offsets = (positions % self.block_size).to(torch.int64)
             rows = torch.arange(N, dtype=torch.int64, device=self.device)
-            physical_blocks = branch_block_tables[rows, logical_blocks].to(
-                torch.int64
-            )
+            physical_blocks = branch_block_tables[rows, logical_blocks].to(torch.int64)
             slot_mapping = physical_blocks * self.block_size + offsets
             seq_lens = (positions + 1).to(torch.int32)
             attn_metadata = self._build_flash_attn_metadata(
@@ -1022,6 +1094,9 @@ class DraftModelRunner(
         input_ids: torch.Tensor,
         num_tokens_per_seq: torch.Tensor,
         seq_ids: torch.Tensor,
+        *,
+        model_positions: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run prefill forward pass for new sequences.
 
@@ -1059,6 +1134,17 @@ class DraftModelRunner(
             positions[offset : offset + n] = torch.arange(n, device=self.device)
             expanded_seq_ids.extend([int(seq_ids[i].item())] * n)
             offset += n
+
+        expanded_seq_ids_tensor = torch.tensor(
+            expanded_seq_ids,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        if model_positions is None:
+            model_positions = self._model_positions(
+                positions,
+                expanded_seq_ids_tensor,
+            )
 
         # Compute slot mapping (vectorized via GPU-resident block table)
         slot_mapping = self._compute_slot_mapping(positions, expanded_seq_ids)
@@ -1103,10 +1189,17 @@ class DraftModelRunner(
             # V1 models don't accept kv_caches as a forward argument;
             # KV cache is managed through the attention backend via
             # set_forward_context.
-            hidden_states = self.model(
-                input_ids=input_ids,
-                positions=positions,
-            )
+            if inputs_embeds is None:
+                hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=model_positions,
+                )
+            else:
+                hidden_states = self.model(
+                    input_ids=None,
+                    positions=model_positions,
+                    inputs_embeds=inputs_embeds,
+                )
 
         # Extract logits at the last position of each sequence
         last_indices = torch.cumsum(num_tokens_per_seq, dim=0) - 1
@@ -1128,6 +1221,73 @@ class DraftModelRunner(
         return last_logits[:, : self.vocab_size]
 
     @torch.inference_mode()
+    def multimodal_prefill(
+        self,
+        input_ids: torch.Tensor,
+        num_tokens_per_seq: torch.Tensor,
+        seq_ids: torch.Tensor,
+        mm_features: list[MultiModalFeatureSpec],
+    ) -> torch.Tensor:
+        """Run draft-local image encoding and language-model prefill."""
+        if input_ids.ndim != 1 or seq_ids.shape[0] != 1:
+            raise ValueError("Multimodal pilot supports one request at a time")
+        model = self.model
+        if model is None or not supports_multimodal(model):
+            raise RuntimeError("Draft model does not support multimodal inputs")
+        if not supports_mrope(model):
+            raise RuntimeError("Multimodal pilot requires draft mRoPE support")
+
+        with torch.profiler.record_function("draft_mm_prefill: vision_encoder"):
+            grouped_inputs = [
+                (feature.modality, feature.data) for feature in mm_features
+            ]
+            multimodal_embeddings: list[torch.Tensor] = []
+            for _, _, mm_kwargs in group_and_batch_mm_kwargs(
+                grouped_inputs,
+                device=self.device,
+            ):
+                outputs = model.embed_multimodal(**mm_kwargs)
+                if outputs is None:
+                    raise RuntimeError("Draft vision encoder returned no embeddings")
+                multimodal_embeddings.extend(outputs)
+
+        is_multimodal = torch.zeros(
+            input_ids.shape[0],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        for feature in mm_features:
+            position = feature.mm_position
+            start = position.offset
+            end = start + position.length
+            if position.is_embed is None:
+                is_multimodal[start:end] = True
+            else:
+                is_multimodal[start:end] |= position.is_embed.to(self.device)
+
+        inputs_embeds = model.embed_input_ids(
+            input_ids,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+        )
+        with torch.profiler.record_function("draft_mm_prefill: mrope"):
+            prompt_token_ids = input_ids.tolist()
+            mrope_positions, mrope_delta = model.get_mrope_input_positions(
+                prompt_token_ids,
+                mm_features,
+            )
+        seq_id = int(seq_ids[0].item())
+        self._mrope_position_deltas_gpu[seq_id] = int(mrope_delta)
+        with torch.profiler.record_function("draft_mm_prefill: language_model"):
+            return self.prefill(
+                input_ids,
+                num_tokens_per_seq,
+                seq_ids,
+                model_positions=mrope_positions.to(self.device),
+                inputs_embeds=inputs_embeds,
+            )
+
+    @torch.inference_mode()
     def decode_step(
         self,
         input_ids: torch.Tensor,
@@ -1137,6 +1297,7 @@ class DraftModelRunner(
         """Run a single decode step, using CUDA graphs when available."""
         assert self._model_loaded, "Call load_model() first"
         B = input_ids.shape[0]
+        model_positions = self._model_positions(positions, seq_ids)
 
         # Ensure enough blocks for current positions (needed for
         # standalone draft model which doesn't pre-allocate via
@@ -1163,7 +1324,7 @@ class DraftModelRunner(
             g = self._decode_graphs[B]
             # Copy inputs into graph's pre-allocated buffers
             g["input_ids"][:B].copy_(input_ids)
-            g["positions"][:B].copy_(positions)
+            g["positions"][..., :B].copy_(model_positions)
             g["slot_mapping"][:B].copy_(slot_mapping)
             g["seq_lens"][:B].copy_(seq_lens)
             g["block_tables"][:B].copy_(block_tables)
@@ -1199,7 +1360,7 @@ class DraftModelRunner(
             ):
                 hidden_states = self.model(
                     input_ids=input_ids,
-                    positions=positions,
+                    positions=model_positions,
                 )
 
         # Compute logits

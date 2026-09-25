@@ -82,9 +82,7 @@ def run_draft_server(args: argparse.Namespace) -> None:
     device_id = getattr(args, "draft_server_device", None)
     bind_address = f"tcp://*:{port}"
 
-    # Set the CUDA device for the draft server process.
-    # This allows running without CUDA_VISIBLE_DEVICES isolation
-    # so NCCL can see all GPUs for P2P transfers.
+    # Keep peer GPUs visible so CUDA IPC can establish P2P mappings.
     if device_id is not None:
         import torch
 

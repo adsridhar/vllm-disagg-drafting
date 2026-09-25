@@ -97,6 +97,14 @@ class DraftServerCacheBuildMixin:
         runner = self.draft_model_runner
         if runner is None:
             return
+        from vllm.v1.spec_decode.disagg_draft_trace import (
+            finish_cuda_timer,
+            start_cuda_timer,
+            trace_enabled,
+            trace_event,
+        )
+
+        cuda_start = start_cuda_timer()
         with torch.profiler.record_function(f"cache_build_B{batch_size}"):
             # Apply any swap deferred from the synchronous SPECULATE
             # path. Mutates _seq_lens / block tables and recycles
@@ -123,6 +131,27 @@ class DraftServerCacheBuildMixin:
             # so any leftover from cache_build is overwritten before it
             # can be read.
             self._build_next_cache(batch_size, seq_ids, vs_id)
+
+        if trace_enabled():
+            seq_ids_list = seq_ids.tolist()
+            cache_build_latency_ms = finish_cuda_timer(cuda_start)
+            trace_event(
+                "draft",
+                "cache_build",
+                verify_server_id=vs_id,
+                sequence_ids=seq_ids_list,
+                logical_positions=[
+                    runner._seq_lens.get(int(sid)) for sid in seq_ids_list
+                ],
+                decode_mode=(
+                    "cuda_graph" if runner._decode_graphs_captured else "eager"
+                ),
+                tree_decode_mode=(
+                    "cuda_graph" if runner._tree_decode_captured else "eager"
+                ),
+                cuda_elapsed_ms=cache_build_latency_ms,
+                cache_build_latency_ms=cache_build_latency_ms,
+            )
 
     def _fused_cleanup_and_glue(
         self,
@@ -386,6 +415,15 @@ class DraftServerCacheBuildMixin:
         K = self.K
         if self.cache is None or self.outcome_predictor is None:
             return
+
+        from vllm.v1.spec_decode.disagg_draft_trace import (
+            finish_cuda_timer,
+            start_cuda_timer,
+            trace_enabled,
+            trace_event,
+        )
+
+        cuda_start = start_cuda_timer()
 
         with torch.profiler.record_function(f"cache_build_merged_n{len(slice_metas)}"):
             # Merged path runs swap_block_tables synchronously in the
@@ -713,6 +751,24 @@ class DraftServerCacheBuildMixin:
                         vs_id=sm["vs_id"],
                     )
                     start = end
+
+        if trace_enabled():
+            cache_build_latency_ms = finish_cuda_timer(cuda_start)
+            trace_event(
+                "draft",
+                "cache_build",
+                verify_server_ids=[sm["vs_id"] for sm in slice_metas],
+                sequence_ids=seq_ids_list,
+                merged_slices=len(slice_metas),
+                decode_mode=(
+                    "cuda_graph" if runner._decode_graphs_captured else "eager"
+                ),
+                tree_decode_mode=(
+                    "cuda_graph" if runner._tree_decode_captured else "eager"
+                ),
+                cuda_elapsed_ms=cache_build_latency_ms,
+                cache_build_latency_ms=cache_build_latency_ms,
+            )
 
     # ------------------------------------------------------------------
     # Response helpers

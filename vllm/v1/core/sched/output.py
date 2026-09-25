@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from vllm.sampling_params import SamplingParams
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
     from vllm.v1.request import Request
+    from vllm.v1.spec_decode.multimodal import DisaggMultimodalRequest
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object
@@ -29,6 +30,7 @@ else:
     PoolingParams = object
     SamplingParams = object
     Request = object
+    DisaggMultimodalRequest = object
 
 
 @dataclass
@@ -43,6 +45,7 @@ class NewRequestData:
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
+    disagg_mm_envelope: "DisaggMultimodalRequest | None" = None
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -65,6 +68,7 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
+            disagg_mm_envelope=request.disagg_mm_envelope,
             prefill_token_ids=prefill_token_ids,
         )
 

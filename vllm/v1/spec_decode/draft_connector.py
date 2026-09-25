@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     import torch.multiprocessing.reductions  # noqa: F401
 
     from vllm.v1.spec_decode.draft_data_models import TensorRef
+    from vllm.v1.spec_decode.multimodal import DisaggMultimodalRequest
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ _DTYPE_MAP: dict[str, torch.dtype] = {
     "bfloat16": torch.bfloat16,
     "int64": torch.int64,
     "int32": torch.int32,
+    "uint8": torch.uint8,
     "bool": torch.bool,
 }
 
@@ -146,6 +148,7 @@ class DraftConnector(ABC):
                 "temperatures": temperatures,
                 "needs_logits": needs_logits,
                 "eagle_inputs": eagle_inputs,
+                "transport": "zmq",
             },
         )
 
@@ -175,6 +178,10 @@ class DraftConnector(ABC):
         self,
         seq_id: int,
         prompt_token_ids: torch.Tensor,
+        *,
+        request_id: str | None = None,
+        cache_generation: int = 0,
+        mm_envelope: DisaggMultimodalRequest | None = None,
     ) -> None: ...
 
     @abstractmethod
@@ -439,22 +446,62 @@ class ZmqDraftConnector(DraftConnector):
         self,
         seq_id: int,
         prompt_token_ids: torch.Tensor,
+        *,
+        request_id: str | None = None,
+        cache_generation: int = 0,
+        mm_envelope: DisaggMultimodalRequest | None = None,
     ) -> None:
         from vllm.v1.spec_decode.draft_data_models import (
+            PrefillReady,
             PrefillRequest,
+            decode,
+            decode_command,
             encode_command,
         )
 
         self._ensure_connected()
 
         _prompt = prompt_token_ids.to(torch.int64)
+        images = (
+            []
+            if mm_envelope is None
+            else [image.contiguous() for image in mm_envelope.images]
+        )
         prefill = PrefillRequest(
             verify_server_id=self._verify_server_id,
             seq_id=seq_id,
             prompt_token_ids_ref=self._make_tensor_ref(_prompt),
+            request_id=request_id,
+            cache_generation=cache_generation,
+            mm_prompt=None if mm_envelope is None else mm_envelope.prompt,
+            mm_processor_kwargs=(
+                None if mm_envelope is None else mm_envelope.processor_kwargs
+            ),
+            mm_image_refs=[self._make_tensor_ref(image) for image in images] or None,
         )
         cmd_bytes = encode_command("PREFILL", prefill)
-        await self._send_multipart(cmd_bytes, [_prompt])
+        await self._send_multipart(cmd_bytes, [_prompt, *images])
+        if mm_envelope is not None:
+            import zmq
+
+            assert self._socket is not None
+            timeout_ms = self._socket.getsockopt(zmq.RCVTIMEO)
+            self._socket.setsockopt(zmq.RCVTIMEO, max(timeout_ms, 60_000))
+            try:
+                response, _ = await self._recv_multipart()
+            finally:
+                self._socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+            command = decode_command(response)
+            if command.command != "PREFILL_READY":
+                raise RuntimeError(f"Unexpected PREFILL response: {command.command}")
+            ready = decode(command.payload, PrefillReady)
+            if (
+                ready.request_id != request_id
+                or ready.cache_generation != cache_generation
+            ):
+                raise RuntimeError("Mismatched multimodal PREFILL response")
+            if ready.error:
+                raise RuntimeError(f"Draft multimodal PREFILL failed: {ready.error}")
 
     async def send_free_seq(self, seq_ids: torch.Tensor) -> None:
         from vllm.v1.spec_decode.draft_data_models import (
@@ -965,6 +1012,7 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
                 "seq16": seq16,
                 "batch_size": batch_size,
                 "is_eagle": eagle_inputs is not None,
+                "transport": "cuda_ipc",
             },
         )
 

@@ -63,6 +63,19 @@ class PrefillRequest(msgspec.Struct):
     verify_server_id: str
     seq_id: int
     prompt_token_ids_ref: TensorRef
+    request_id: str | None = None
+    cache_generation: int = 0
+    mm_prompt: str | list[int] | None = None
+    mm_processor_kwargs: dict[str, object] | None = None
+    mm_image_refs: list[TensorRef] | None = None
+
+
+class PrefillReady(msgspec.Struct):
+    """Draft_Server → Verify_Server: multimodal PREFILL completion."""
+
+    request_id: str
+    cache_generation: int
+    error: str = ""
 
 
 class FreeSeqRequest(msgspec.Struct):
@@ -116,6 +129,7 @@ _decoders: dict[type, msgspec.msgpack.Decoder] = {
     VerificationOutcome: msgspec.msgpack.Decoder(VerificationOutcome),
     SpeculationResponse: msgspec.msgpack.Decoder(SpeculationResponse),
     PrefillRequest: msgspec.msgpack.Decoder(PrefillRequest),
+    PrefillReady: msgspec.msgpack.Decoder(PrefillReady),
     FreeSeqRequest: msgspec.msgpack.Decoder(FreeSeqRequest),
     IpcHandshake: msgspec.msgpack.Decoder(IpcHandshake),
     IpcHandshakeAck: msgspec.msgpack.Decoder(IpcHandshakeAck),
@@ -127,6 +141,7 @@ DraftMessage = (
     | VerificationOutcome
     | SpeculationResponse
     | PrefillRequest
+    | PrefillReady
     | FreeSeqRequest
     | IpcHandshake
     | IpcHandshakeAck
@@ -150,6 +165,7 @@ def encode_command(
         VerificationOutcome
         | SpeculationResponse
         | PrefillRequest
+        | PrefillReady
         | FreeSeqRequest
         | IpcHandshake
         | IpcHandshakeAck

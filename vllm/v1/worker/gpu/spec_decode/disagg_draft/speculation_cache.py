@@ -396,8 +396,7 @@ class SpeculationCache:
             hidden_states: [N, hidden_size] — EAGLE head output hidden
                 states. Only used when ``needs_hidden_states=True``.
             vs_id: verify server that owns these entries. Default is
-                ``"__default__"`` for the 1:1 NCCL path where there is
-                only ever one VS.
+                ``"__default__"`` for a single verify server.
         """
         N = seq_ids.shape[0]
 

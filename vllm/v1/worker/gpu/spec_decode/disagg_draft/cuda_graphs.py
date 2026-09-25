@@ -159,7 +159,8 @@ class DraftCudaGraphMixin:
         """
         max_n = max(sizes)
         g_input_ids = torch.zeros(max_n, dtype=torch.int64, device=self.device)
-        g_positions = torch.zeros(max_n, dtype=torch.long, device=self.device)
+        position_shape = (3, max_n) if self._uses_mrope else (max_n,)
+        g_positions = torch.zeros(position_shape, dtype=torch.long, device=self.device)
         g_slot_mapping = torch.zeros(max_n, dtype=torch.int64, device=self.device)
         g_seq_lens = torch.ones(max_n, dtype=torch.int32, device=self.device)
         g_block_tables = torch.zeros(
@@ -198,7 +199,7 @@ class DraftCudaGraphMixin:
             ):
                 g_hidden[:n] = self.model(
                     input_ids=g_input_ids[:n],
-                    positions=g_positions[:n],
+                    positions=g_positions[..., :n],
                 )
 
             # Capture
@@ -215,7 +216,7 @@ class DraftCudaGraphMixin:
             ):
                 g_hidden[:n] = self.model(
                     input_ids=g_input_ids[:n],
-                    positions=g_positions[:n],
+                    positions=g_positions[..., :n],
                 )
 
             if self._decode_graph_pool is None:

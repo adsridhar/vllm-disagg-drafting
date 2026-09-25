@@ -8,6 +8,8 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Generic, overload
 
+import numpy as np
+import torch
 from typing_extensions import TypeVar
 
 from vllm.inputs import (
@@ -30,6 +32,7 @@ from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY as mm_registry
 from vllm.multimodal.cache import BaseMultiModalProcessorCache
 from vllm.multimodal.gpu_ipc_memory import maybe_init_mm_gpu_ipc_pool
+from vllm.multimodal.image import convert_image_mode, normalize_image
 from vllm.multimodal.parse import (
     MultiModalDataItems,
     MultiModalUUIDItems,
@@ -43,6 +46,7 @@ from vllm.utils.async_utils import make_async
 from vllm.utils.counter import AtomicCounter
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.metrics.stats import MultiModalCacheStats
+from vllm.v1.spec_decode.multimodal import DisaggMultimodalRequest
 
 from .embed_utils import safe_load_prompt_embeds
 from .inputs import (
@@ -733,6 +737,7 @@ class BaseRenderer(ABC, Generic[_T]):
         mm_uuids: MultiModalUUIDDict | None,
         mm_processor_kwargs: Mapping[str, object] | None,
         tokenization_kwargs: dict[str, Any] | None,
+        disagg_prompt: str | None = None,
         *,
         skip_mm_cache: bool = False,
     ) -> "MultiModalInput":
@@ -764,6 +769,49 @@ class BaseRenderer(ABC, Generic[_T]):
 
         self.update_mm_cache_stats()
 
+        spec = self.config.speculative_config
+        if spec is not None and spec.disagg_draft_addresses and "image" in mm_data:
+            images = mm_data["image"]
+            if not isinstance(images, list):
+                images = [images]
+            canonical_images: list[torch.Tensor] = []
+            for image in images:
+                if image is None:
+                    raise ValueError(
+                        "Disaggregated multimodal draft requires image data"
+                    )
+                if isinstance(image, torch.Tensor):
+                    if (
+                        image.dtype != torch.uint8
+                        or image.ndim != 3
+                        or image.shape[-1] != 3
+                    ):
+                        raise ValueError(
+                            "Disaggregated multimodal draft requires HWC uint8 RGB "
+                            "image tensors"
+                        )
+                    canonical_images.append(image.detach().cpu().contiguous())
+                elif hasattr(image, "convert"):
+                    image = convert_image_mode(normalize_image(image), "RGB")
+                    rgb = np.asarray(image, dtype=np.uint8).copy()
+                    canonical_images.append(torch.from_numpy(rgb))
+                else:
+                    raise ValueError(
+                        "Disaggregated multimodal draft supports only image tensors "
+                        "or PIL images"
+                    )
+            if disagg_prompt is None and isinstance(prompt, str):
+                disagg_prompt = prompt
+            if disagg_prompt is None:
+                raise ValueError(
+                    "Disaggregated multimodal draft requires a text prompt"
+                )
+            mm_inputs["disagg_mm_envelope"] = DisaggMultimodalRequest(
+                prompt=disagg_prompt,
+                images=canonical_images,
+                processor_kwargs=dict(mm_processor_kwargs or {}),
+            )
+
         return mm_inputs
 
     def _process_tokens(
@@ -784,6 +832,7 @@ class BaseRenderer(ABC, Generic[_T]):
                 multi_modal_data,
                 mm_processor_kwargs=prompt.get("mm_processor_kwargs"),
                 tokenization_kwargs=None,  # Tokenization already done in Step 2
+                disagg_prompt=prompt.get("prompt"),
                 mm_uuids=prompt.get("multi_modal_uuids"),
                 skip_mm_cache=skip_mm_cache,
             )
@@ -847,6 +896,7 @@ class BaseRenderer(ABC, Generic[_T]):
                 multi_modal_data,
                 mm_processor_kwargs=prompt.get("mm_processor_kwargs"),
                 tokenization_kwargs=None,
+                disagg_prompt=prompt.get("prompt"),
                 mm_uuids=prompt.get("multi_modal_uuids"),
                 skip_mm_cache=skip_mm_cache,
             )

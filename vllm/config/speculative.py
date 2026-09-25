@@ -311,10 +311,14 @@ class SpeculativeConfig:
     token probabilities in the draft model to increase cache hit rate.
     1.0 = no modification (standard sampling)."""
 
-    disagg_jit_fallback: bool = True
+    disagg_uniform_fanout: bool = False
+    """Allocate the cache-build fan-out budget evenly across acceptance
+    positions instead of using the geometric allocation."""
+
+    disagg_jit_fallback: bool = False
     """Enable just-in-time fallback speculation for cache misses. When True,
     the draft model generates tokens sequentially on cache miss. When False,
-    random tokens are used for misses."""
+    the response contains the bonus token followed by placeholders."""
 
     disagg_draft_routing_policy: str = "round_robin"
     """Routing policy for the N:M draft router.

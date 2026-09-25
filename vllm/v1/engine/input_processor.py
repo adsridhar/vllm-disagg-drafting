@@ -377,12 +377,17 @@ class InputProcessor:
                     )
                 )
 
+        disagg_mm_envelope = decoder_inputs.get("disagg_mm_envelope")
+        if disagg_mm_envelope is not None:
+            disagg_mm_envelope.request_id = request_id
+
         return EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
             prompt_embeds=prompt_embeds,
             prompt_is_token_ids=prompt_is_token_ids,
             mm_features=mm_features,
+            disagg_mm_envelope=disagg_mm_envelope,
             sampling_params=sampling_params,
             pooling_params=pooling_params,
             arrival_time=arrival_time,

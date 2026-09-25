@@ -37,6 +37,30 @@ logger = init_logger(__name__)
 class DraftServerSpeculateMixin:
     """Mixin: SPECULATE handlers (single-VS + cross-VS merged)."""
 
+    def _apply_jit_fallback(
+        self,
+        runner: Any,
+        miss_mask: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+        seq_ids: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        draft_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Replace cache-miss placeholders with JIT draft proposals."""
+        if not self.jit_fallback or runner is None:
+            return miss_mask
+        miss_indices = miss_mask.nonzero(as_tuple=True)[0]
+        if miss_indices.numel() == 0:
+            return miss_mask
+        tokens, logits = runner.jit_propose(
+            bonus_tokens[miss_indices],
+            seq_ids[miss_indices],
+            self.K,
+        )
+        draft_tokens[miss_indices] = tokens
+        draft_logits[miss_indices] = logits
+        return torch.zeros_like(miss_mask)
+
     async def _handle_speculation(
         self,
         verify_server_id: str,
@@ -46,17 +70,14 @@ class DraftServerSpeculateMixin:
         """Handle SPECULATE command with hybrid swap+JIT strategy.
 
         Replicates the ``DisaggDraftWorker._handle_speculation`` flow
-        using the server's own components, decoupled from the NCCL
-        command loop.  The steps are:
+        using the server's own components. The steps are:
 
-        1. Receive tensor payloads out-of-band (NCCL, matching the
-           deterministic send order in ``ZmqDraftConnector``).
+        1. Receive tensors from ZMQ frames or a CUDA IPC ring.
         2. Reconcile ``_seq_lens`` from this round's k_accepted.
         3. Cache lookup via ``SpeculationCache.lookup``.
         4. Hybrid swap+zero-fill: cache hits use cached tokens; misses
            get zero drafts (cache_build seeds entries for next round).
-        5. Send ``SpeculationResponse`` metadata over ZMQ and tensor
-           payloads over NCCL.
+        5. Return tensors through the request's ZMQ or CUDA IPC transport.
         6. Build speculation cache for the NEXT round (async overlap).
 
         On error, sends a fallback response (all zeros) so the verify
@@ -405,6 +426,14 @@ class DraftServerSpeculateMixin:
         """
         B = outcome.batch_size
         _spec_start = time.monotonic()
+        from vllm.v1.spec_decode.disagg_draft_trace import (
+            finish_cuda_timer,
+            start_cuda_timer,
+            trace_enabled,
+            trace_event,
+        )
+
+        cuda_start = start_cuda_timer()
         self.metrics.draft_batch_size.set(B)
 
         # ---- Step 1: Receive tensor payloads ----
@@ -430,12 +459,13 @@ class DraftServerSpeculateMixin:
 
         # ---- Step 2: Reconcile runner state with this round's base ----
         runner = self.draft_model_runner
+        k_accepted_list = (
+            preloaded_k_accepted_list
+            if preloaded_k_accepted_list is not None
+            else k_accepted.tolist()
+        )
         if runner is not None:
             with torch.profiler.record_function("sync_seq_lens"):
-                if preloaded_k_accepted_list is not None:
-                    k_accepted_list = preloaded_k_accepted_list
-                else:
-                    k_accepted_list = k_accepted.tolist()
                 self._sync_runner_seq_lens_and_blocks(
                     runner,
                     seq_ids_list,
@@ -469,6 +499,48 @@ class DraftServerSpeculateMixin:
         draft_tokens = cached_tokens.clone()
         col0 = draft_tokens[:, 0]
         draft_tokens[:, 0] = torch.where(miss_mask, bonus_tokens, col0)
+        draft_logits = None
+        zero_fallback_mask = miss_mask
+        if self.jit_fallback:
+            draft_logits = torch.zeros(
+                B,
+                self.K,
+                self.vocab_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            zero_fallback_mask = self._apply_jit_fallback(
+                runner,
+                miss_mask,
+                bonus_tokens,
+                seq_ids,
+                draft_tokens,
+                draft_logits,
+            )
+
+        if trace_enabled():
+            cache_hits_list = cache_hits.tolist()
+            logical_positions = (
+                [runner._seq_lens.get(sid) for sid in seq_ids_list]
+                if runner is not None
+                else [None] * B
+            )
+            trace_event(
+                "draft",
+                "speculate",
+                verify_server_id=verify_server_id,
+                sequence_ids=seq_ids_list,
+                accepted_counts=k_accepted_list,
+                bonus_tokens=bonus_tokens.tolist(),
+                logical_positions=logical_positions,
+                cache_hits=cache_hits_list,
+                cache_decisions=[
+                    "hit" if hit else "miss_recovery" for hit in cache_hits_list
+                ],
+                proposed_token_ids=draft_tokens.tolist(),
+                transport="cuda_ipc" if ipc_send_ctx is not None else "zmq",
+                cuda_elapsed_ms=finish_cuda_timer(cuda_start),
+            )
 
         if ipc_send_ctx is not None:
             peer, slot, seq16 = ipc_send_ctx
@@ -502,7 +574,9 @@ class DraftServerSpeculateMixin:
                         "cached_logits": cached_logits,
                         "hit_mask": hit_mask,
                         "miss_mask": miss_mask,
+                        "zero_fallback_mask": zero_fallback_mask,
                         "draft_tokens": draft_tokens,
+                        "draft_logits": draft_logits,
                         "seq_ids": seq_ids,
                         "seq_ids_list": seq_ids_list,
                         "bonus_tokens": bonus_tokens,
@@ -513,13 +587,14 @@ class DraftServerSpeculateMixin:
             return None
 
         # ZMQ / non-IPC path: original synchronous Phase B + return.
-        draft_logits = torch.zeros(
-            B,
-            self.K,
-            self.vocab_size,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        if draft_logits is None:
+            draft_logits = torch.zeros(
+                B,
+                self.K,
+                self.vocab_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
 
         # ---- Step 4: Copy cache hits into response (swap deferred) ----
         used_swap_for_hits = False
@@ -561,7 +636,7 @@ class DraftServerSpeculateMixin:
         self._last_draft_tokens = draft_tokens.clone()
         self._last_draft_logits = draft_logits.clone()
         self._last_bonus_tokens = bonus_tokens.clone()
-        self._last_miss_mask = miss_mask.clone()
+        self._last_miss_mask = zero_fallback_mask.clone()
 
         send_logits = outcome.needs_logits
         self.metrics.draft_generation_latency.observe(time.monotonic() - _spec_start)
@@ -764,6 +839,24 @@ class DraftServerSpeculateMixin:
         # Zero-fallback seed: bonus token in col 0 for miss rows.
         col0 = draft_tokens[:, 0]
         draft_tokens[:, 0] = torch.where(miss_mask, bonus_cat, col0)
+        draft_logits = None
+        zero_fallback_mask = miss_mask
+        if self.jit_fallback:
+            draft_logits = torch.zeros(
+                B_total,
+                self.K,
+                self.vocab_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            zero_fallback_mask = self._apply_jit_fallback(
+                runner,
+                miss_mask,
+                bonus_cat,
+                seq_ids_cat,
+                draft_tokens,
+                draft_logits,
+            )
 
         if all_ipc:
             # Send responses NOW, before doing any of the cache_build
@@ -810,7 +903,9 @@ class DraftServerSpeculateMixin:
                 "cached_logits": cached_logits,
                 "hit_mask": hit_mask,
                 "miss_mask": miss_mask,
+                "zero_fallback_mask": zero_fallback_mask,
                 "draft_tokens": draft_tokens,
+                "draft_logits": draft_logits,
                 "seq_ids_cat": seq_ids_cat,
                 "seq_ids_list": seq_ids_list,
                 "bonus_cat": bonus_cat,
@@ -827,13 +922,14 @@ class DraftServerSpeculateMixin:
         # ZMQ (or mixed transport) path: original synchronous Phase B
         # + response send, kept for ZMQ callers that need
         # ``draft_logits`` in the response.
-        draft_logits = torch.zeros(
-            B_total,
-            self.K,
-            self.vocab_size,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        if draft_logits is None:
+            draft_logits = torch.zeros(
+                B_total,
+                self.K,
+                self.vocab_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
 
         # ---- Apply cache hits (swap inline on merged path) ----
         used_swap_for_hits = False
@@ -875,7 +971,7 @@ class DraftServerSpeculateMixin:
         self._last_draft_tokens = draft_tokens.clone()
         self._last_draft_logits = draft_logits.clone()
         self._last_bonus_tokens = bonus_cat.clone()
-        self._last_miss_mask = miss_mask.clone()
+        self._last_miss_mask = zero_fallback_mask.clone()
 
         self.metrics.draft_generation_latency.observe(time.monotonic() - _spec_start)
 
@@ -932,20 +1028,22 @@ class DraftServerSpeculateMixin:
         B = ctx["B"]
         cache_hits = ctx["cache_hits"]
         cached_logits = ctx["cached_logits"]
-        miss_mask = ctx["miss_mask"]
+        zero_fallback_mask = ctx["zero_fallback_mask"]
         draft_tokens = ctx["draft_tokens"]
         seq_ids = ctx["seq_ids"]
         seq_ids_list = ctx["seq_ids_list"]
         bonus_tokens = ctx["bonus_tokens"]
         runner = ctx["runner"]
 
-        draft_logits = torch.zeros(
-            B,
-            self.K,
-            self.vocab_size,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        draft_logits = ctx["draft_logits"]
+        if draft_logits is None:
+            draft_logits = torch.zeros(
+                B,
+                self.K,
+                self.vocab_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
 
         used_swap_for_hits = False
         pending_swap: dict[str, Any] | None = None
@@ -986,7 +1084,7 @@ class DraftServerSpeculateMixin:
         self._last_draft_tokens = draft_tokens.clone()
         self._last_draft_logits = draft_logits.clone()
         self._last_bonus_tokens = bonus_tokens.clone()
-        self._last_miss_mask = miss_mask.clone()
+        self._last_miss_mask = zero_fallback_mask.clone()
         self._last_spec_seq_ids = seq_ids
         self._last_spec_seq_ids_cpu = seq_ids_list
 
@@ -1022,7 +1120,7 @@ class DraftServerSpeculateMixin:
         cache_hits = ctx["cache_hits"]
         cached_logits = ctx["cached_logits"]
         hit_mask = ctx["hit_mask"]
-        miss_mask = ctx["miss_mask"]
+        zero_fallback_mask = ctx["zero_fallback_mask"]
         draft_tokens = ctx["draft_tokens"]
         seq_ids_cat = ctx["seq_ids_cat"]
         seq_ids_list = ctx["seq_ids_list"]
@@ -1032,13 +1130,15 @@ class DraftServerSpeculateMixin:
         B_total = ctx["B_total"]
         runner = ctx["runner"]
 
-        draft_logits = torch.zeros(
-            B_total,
-            self.K,
-            self.vocab_size,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        draft_logits = ctx["draft_logits"]
+        if draft_logits is None:
+            draft_logits = torch.zeros(
+                B_total,
+                self.K,
+                self.vocab_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
 
         # All-miss shortcut: no swap, no blend, no pending_swap_merged.
         # ``cached_logits is None`` when the cache was completely empty
@@ -1083,7 +1183,7 @@ class DraftServerSpeculateMixin:
         self._last_draft_tokens = draft_tokens.clone()
         self._last_draft_logits = draft_logits.clone()
         self._last_bonus_tokens = bonus_cat.clone()
-        self._last_miss_mask = miss_mask.clone()
+        self._last_miss_mask = zero_fallback_mask.clone()
 
         # Build per-VS slice metas and run cache_build inline (we're
         # already in the cache_build task, so this is just a call).

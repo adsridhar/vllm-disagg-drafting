@@ -26,6 +26,7 @@ import asyncio
 import contextlib
 import time as _time
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 import prometheus_client
@@ -33,6 +34,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.v1.spec_decode.disagg_draft_trace import trace_enabled, trace_event
 
 if TYPE_CHECKING:
     from vllm.v1.spec_decode.draft_router import DraftRouter
@@ -186,10 +188,19 @@ class DisaggSpeculatorProxy:
         # Prompt tokens cached for the request lifetime so failover can
         # rebuild draft-side state on a replacement server.
         self._pending_prompt_tokens: dict[str, list[int]] = {}
+        self._pending_mm_envelopes: dict[str, dict[str, Any]] = {}
+        self._prefill_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="disagg-mm-prefill"
+        )
+        self._inflight_prefills: dict[str, Future[None]] = {}
+        self._inflight_prefill_spans: dict[Future[None], Any] = {}
+        self._prefill_started_at: dict[str, float] = {}
 
         # Per-request state for the draft side.
         self._disagg_prefilled_reqs: set[str] = set()
         self._disagg_req_to_seq_id: dict[str, int] = {}
+        self._disagg_cache_generations: dict[str, int] = {}
+        self._disagg_seq_generations: dict[int, int] = {}
         self._disagg_next_seq_id: int = 0
         self._disagg_free_seq_ids: list[int] = []  # recycled seq_ids
 
@@ -261,6 +272,62 @@ class DisaggSpeculatorProxy:
         failover requires replaying PREFILL on the replacement drafter.
         """
         self._pending_prompt_tokens[req_id] = list(prompt_token_ids)
+
+    def cache_new_request_multimodal(
+        self, req_id: str, envelope: dict[str, Any]
+    ) -> None:
+        self._pending_mm_envelopes[req_id] = envelope
+
+    def start_multimodal_prefill(self, req_ids: list[str]) -> None:
+        req_ids = [
+            rid
+            for rid in req_ids
+            if rid not in self._disagg_prefilled_reqs
+            and rid not in self._inflight_prefills
+        ]
+        if not req_ids:
+            return
+        started_at = _time.perf_counter()
+        span = torch.profiler.record_function("disagg_mm_prefill: inflight_window")
+        span.__enter__()
+        future = self._prefill_executor.submit(self._prefill_new_requests, req_ids)
+        self._inflight_prefill_spans[future] = span
+        for rid in req_ids:
+            self._inflight_prefills[rid] = future
+            self._prefill_started_at[rid] = started_at
+
+    def _await_inflight_prefills(self, req_ids: list[str]) -> None:
+        futures = {
+            self._inflight_prefills[rid]
+            for rid in req_ids
+            if rid in self._inflight_prefills
+        }
+        wait_started_at = _time.perf_counter()
+        with torch.profiler.record_function("disagg_mm_prefill: readiness_wait"):
+            for future in futures:
+                try:
+                    future.result()
+                finally:
+                    span = self._inflight_prefill_spans.pop(future, None)
+                    if span is not None:
+                        span.__exit__(None, None, None)
+        finished_at = _time.perf_counter()
+        started_at = [
+            self._prefill_started_at[rid]
+            for rid in req_ids
+            if rid in self._prefill_started_at
+        ]
+        if started_at:
+            trace_event(
+                "target",
+                "multimodal_prefill_overlap",
+                request_ids=req_ids,
+                prefill_latency_ms=(finished_at - min(started_at)) * 1000,
+                readiness_wait_ms=(finished_at - wait_started_at) * 1000,
+            )
+        for rid in req_ids:
+            self._inflight_prefills.pop(rid, None)
+            self._prefill_started_at.pop(rid, None)
 
     @property
     def is_connected(self) -> bool:
@@ -772,6 +839,8 @@ class DisaggSpeculatorProxy:
         stale_by_server: dict[int, list[int]] = defaultdict(list)
         for rid in stale:
             self._pending_prompt_tokens.pop(rid, None)
+            self._pending_mm_envelopes.pop(rid, None)
+            self._disagg_cache_generations.pop(rid, None)
             sid = self._disagg_req_to_seq_id.pop(rid, None)
             if sid is not None:
                 self._disagg_free_seq_ids.append(sid)
@@ -832,17 +901,32 @@ class DisaggSpeculatorProxy:
             prompt_ids_t = torch.tensor(
                 prompt_ids,
                 dtype=torch.int64,
-                device=self.device,
+                device=(
+                    "cpu"
+                    if self._pending_mm_envelopes.get(rid) is not None
+                    else self.device
+                ),
             )
+            sid = self._disagg_req_to_seq_id[rid]
+            generation = self._disagg_seq_generations.get(sid, 0) + 1
+            self._disagg_seq_generations[sid] = generation
+            self._disagg_cache_generations[rid] = generation
             try:
                 self._run_async(
                     connector.send_prefill(
                         seq_id=self._disagg_req_to_seq_id[rid],
                         prompt_token_ids=prompt_ids_t,
+                        request_id=rid,
+                        cache_generation=generation,
+                        mm_envelope=self._pending_mm_envelopes.get(rid),
                     )
                 )
             except Exception as e:
                 logger.error("PREFILL for req %s failed: %s", rid, e)
+                if self._pending_mm_envelopes.get(rid) is not None:
+                    raise RuntimeError(
+                        f"Multimodal draft PREFILL failed for request {rid}"
+                    ) from e
                 if isinstance(e, ConnectionError):
                     server_index = self.router.assignment.get(rid)
                     if server_index is not None:
@@ -868,6 +952,7 @@ class DisaggSpeculatorProxy:
 
         num_reqs = input_batch.num_reqs
         req_ids = input_batch.req_ids
+        self._await_inflight_prefills(req_ids)
         idx_mapping = getattr(input_batch, "idx_mapping", None)
         if idx_mapping is not None:
             idx_mapping = idx_mapping[:num_reqs]
@@ -1037,6 +1122,21 @@ class DisaggSpeculatorProxy:
                         )
                     )
 
+        trace_ctx = None
+        if trace_enabled():
+            trace_ctx = {
+                "request_ids": active_req_ids,
+                "sequence_ids": seq_ids.tolist(),
+                "cache_generations": [
+                    self._disagg_cache_generations.get(rid, 0) for rid in active_req_ids
+                ],
+                "accepted_counts": k_accepted.tolist(),
+                "bonus_tokens": bonus_tokens.tolist(),
+                "transports": [
+                    handle.state.get("transport", "unknown") for handle in handles
+                ],
+            }
+
         return {
             "active_req_indices": active_req_indices,
             "srv_order": srv_order,
@@ -1045,6 +1145,7 @@ class DisaggSpeculatorProxy:
             "B_active": B_active,
             "k_accepted": k_accepted,
             "dispatch_t0": _time.perf_counter(),
+            "trace": trace_ctx,
         }
 
     def _do_eagle_propose_dispatch(
@@ -1159,10 +1260,17 @@ class DisaggSpeculatorProxy:
             ]
             return await asyncio.gather(*coros, return_exceptions=True)
 
+        wait_t0 = _time.perf_counter() if trace_enabled() else None
         with record_function("propose_await_gather"):
             results = self._run_async(_gather_awaits())
+        response_wait_ms = (
+            (_time.perf_counter() - wait_t0) * 1000.0 if wait_t0 is not None else None
+        )
 
         direct_tokens: torch.Tensor | None = None
+        trace_cache_hits: list[bool | None] | None = None
+        if trace_enabled():
+            trace_cache_hits = [None] * B_active
         for srv_idx, local_indices, result in zip(
             srv_order,
             srv_local_indices,
@@ -1184,7 +1292,13 @@ class DisaggSpeculatorProxy:
                 )
                 continue
 
-            _, srv_draft_toks, srv_draft_logits = result
+            srv_cache_hits, srv_draft_toks, srv_draft_logits = result
+            if trace_cache_hits is not None:
+                for local_j, global_j in enumerate(local_indices):
+                    if local_j < srv_cache_hits.shape[0]:
+                        trace_cache_hits[global_j] = bool(
+                            srv_cache_hits[local_j].item()
+                        )
             if (
                 len(results) == 1
                 and local_indices == list(range(B_active))
@@ -1247,6 +1361,17 @@ class DisaggSpeculatorProxy:
         if direct_tokens is not None:
             draft_toks_out = direct_tokens
         draft_toks_out = draft_toks_out.clamp(min=0, max=target_vocab - 1)
+        trace_ctx = ctx.get("trace")
+        if trace_ctx is not None:
+            trace_event(
+                "verify",
+                "draft_response",
+                **trace_ctx,
+                cache_hits=trace_cache_hits,
+                proposed_token_ids=draft_toks_out.tolist(),
+                round_trip_ms=dt_ms,
+                response_wait_ms=response_wait_ms,
+            )
         if active_req_indices == list(range(num_reqs)):
             self.draft_tokens[:num_reqs].copy_(draft_toks_out[:num_reqs])
         else:

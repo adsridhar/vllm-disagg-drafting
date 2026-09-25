@@ -27,6 +27,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.thinking_budget_state import (
     maybe_create_thinking_budget_state_holder,
 )
+from vllm.v1.spec_decode.multimodal import DisaggMultimodalRequest
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable, SlotMappingMode
 
@@ -56,6 +57,7 @@ class CachedRequestState:
     # Per-position mask for mixed-mode inputs (e.g chat completion with
     # prompt_embeds content parts). See `Request.prompt_is_token_ids`.
     prompt_is_token_ids: list[bool] | None = None
+    disagg_mm_envelope: DisaggMultimodalRequest | None = None
 
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0

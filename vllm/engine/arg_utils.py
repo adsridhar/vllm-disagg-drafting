@@ -1663,7 +1663,8 @@ class EngineArgs:
             type=int,
             default=None,
             help="CUDA device index for the Draft Server. Use this "
-            "instead of CUDA_VISIBLE_DEVICES to allow NCCL P2P "
+            "instead of CUDA_VISIBLE_DEVICES isolation so CUDA IPC can "
+            "establish P2P mappings "
             "with verify servers on other GPUs. Example: "
             "--draft-server-device 7",
         )

@@ -50,6 +50,7 @@ def _tensor_bytes(tensor: torch.Tensor) -> bytes:
 def test_dtype_helpers():
     assert _dtype_to_str(torch.float32) == "float32"
     assert _str_to_dtype("int64") == torch.int64
+    assert _str_to_dtype("uint8") == torch.uint8
 
 
 def test_bfloat16_wire_bytes_preserve_dtype_and_size():
@@ -305,6 +306,7 @@ def test_cuda_ipc_dispatch_copies_eagle_payload():
         "seq16": 1,
         "batch_size": 1,
         "is_eagle": True,
+        "transport": "cuda_ipc",
     }
     assert connector._buf.req_eagle_num_tokens[0].item() == 2
     assert torch.equal(

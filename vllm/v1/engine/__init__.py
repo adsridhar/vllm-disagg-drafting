@@ -19,6 +19,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.stats import PrefillStats, SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.serial_utils import UtilityResult
+from vllm.v1.spec_decode.multimodal import DisaggMultimodalRequest
 
 # Type for pause_generation mode parameter.
 # - "abort": Abort all in-flight requests immediately (default).
@@ -110,6 +111,9 @@ class EngineCoreRequest(
     cache_salt: str | None
     data_parallel_rank: int | None
     prompt_embeds: torch.Tensor | None = None
+    # Image-only, model-neutral inputs for a disaggregated draft processor.
+    # Unset for normal and text-only requests.
+    disagg_mm_envelope: DisaggMultimodalRequest | None = None
 
     # Per-position mask for mixed-mode inputs (e.g chat completion with
     # prompt_embeds content parts). `True` means the position is a real

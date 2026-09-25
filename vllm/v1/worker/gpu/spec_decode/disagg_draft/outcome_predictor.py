@@ -145,6 +145,7 @@ class OutcomePredictor:
         acceptance_rate: Estimated acceptance rate for geometric allocation.
         power_law_exponent: Power-law exponent r for cache hit scaling.
         device: CUDA device.
+        uniform_fanout: Whether to allocate the fan-out budget evenly.
     """
 
     def __init__(
@@ -154,6 +155,7 @@ class OutcomePredictor:
         acceptance_rate: float = 0.85,
         power_law_exponent: float = 1.5,
         device: torch.device | None = None,
+        uniform_fanout: bool = False,
     ):
         device = device or torch.device("cuda")
         self.K = num_speculative_tokens
@@ -162,12 +164,19 @@ class OutcomePredictor:
 
         # Compute per-position fan-out allocation
         num_positions = self.K + 1
-        self.fan_out_list = compute_geometric_fanout(
-            total_budget=total_fan_out,
-            num_positions=num_positions,
-            acceptance_rate=acceptance_rate,
-            power_law_exponent=power_law_exponent,
-        )
+        if uniform_fanout:
+            base, remainder = divmod(self.total_fan_out, num_positions)
+            self.fan_out_list = [
+                base + int(position < remainder)
+                for position in range(num_positions)
+            ]
+        else:
+            self.fan_out_list = compute_geometric_fanout(
+                total_budget=total_fan_out,
+                num_positions=num_positions,
+                acceptance_rate=acceptance_rate,
+                power_law_exponent=power_law_exponent,
+            )
         self.fan_out_tensor = torch.tensor(
             self.fan_out_list, dtype=torch.int64, device=device
         )

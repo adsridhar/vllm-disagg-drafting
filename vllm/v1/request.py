@@ -27,6 +27,7 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+    from vllm.v1.spec_decode.multimodal import DisaggMultimodalRequest
 
 
 @dataclass
@@ -68,6 +69,7 @@ class Request:
         prompt_embeds: torch.Tensor | None = None,
         prompt_is_token_ids: list[bool] | None = None,
         mm_features: list[MultiModalFeatureSpec] | None = None,
+        disagg_mm_envelope: "DisaggMultimodalRequest | None" = None,
         lora_request: "LoRARequest | None" = None,
         cache_salt: str | None = None,
         priority: int = 0,
@@ -94,6 +96,7 @@ class Request:
                 reasoning_parser_kwargs
             )
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
+        self.disagg_mm_envelope = disagg_mm_envelope
 
         self.status = RequestStatus.WAITING
         self.events: list[EngineCoreEvent] = []
@@ -234,6 +237,7 @@ class Request:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             mm_features=request.mm_features,
+            disagg_mm_envelope=request.disagg_mm_envelope,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
             arrival_time=request.arrival_time,
