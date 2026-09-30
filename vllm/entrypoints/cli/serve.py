@@ -52,6 +52,12 @@ class ServeSubcommand(CLISubcommand):
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
 
+        if args.draft_server:
+            from vllm.v1.spec_decode.remote_draft_service import run_draft_server
+
+            run_draft_server(args)
+            return
+
         if getattr(args, "grpc", False):
             from vllm.entrypoints.grpc_server import serve_grpc
 

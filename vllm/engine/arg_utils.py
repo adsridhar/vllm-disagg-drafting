@@ -741,6 +741,9 @@ class EngineArgs:
 
     shutdown_timeout: int = 0
 
+    draft_server: bool = False
+    draft_server_port: int = 50051
+
     weight_transfer_config: WeightTransferConfig | None = get_field(
         VllmConfig,
         "weight_transfer_config",
@@ -1636,6 +1639,17 @@ class EngineArgs:
             type=int,
             default=0,
             help="Shutdown timeout in seconds. 0 = abort, >0 = wait.",
+        )
+        parser.add_argument(
+            "--draft-server",
+            action="store_true",
+            help="Serve this model as a stateless speculative draft service.",
+        )
+        parser.add_argument(
+            "--draft-server-port",
+            type=int,
+            default=50051,
+            help="Port for the stateless speculative draft service.",
         )
 
         parser.add_argument(

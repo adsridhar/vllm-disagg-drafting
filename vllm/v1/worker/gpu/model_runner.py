@@ -251,6 +251,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+        if self.speculator is not None and hasattr(
+            self.speculator, "bind_request_state"
+        ):
+            self.speculator.bind_request_state(self.req_states)
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -352,7 +356,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
-            if self.speculator is not None:
+            if isinstance(self.speculator, DraftModelSpeculator):
                 prepare_communication_buffer_for_model(self.speculator.model)
 
         # Initialize the components that require the model.

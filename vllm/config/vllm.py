@@ -1061,6 +1061,17 @@ class VllmConfig:
             and self.parallel_config.all2all_backend == "deepep_high_throughput"
         )
 
+        uses_remote_draft = (
+            self.speculative_config is not None
+            and self.speculative_config.disagg_draft_backend is not None
+        )
+        if uses_remote_draft and not self.use_v2_model_runner:
+            raise ValueError("Remote drafting currently requires the V2 GPU runner.")
+        if uses_remote_draft and self.scheduler_config.async_scheduling:
+            raise ValueError("Remote drafting does not support async scheduling.")
+        if uses_remote_draft and self.scheduler_config.async_scheduling is None:
+            self.scheduler_config.async_scheduling = False
+
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative
@@ -2198,6 +2209,11 @@ class VllmConfig:
             # TODO: ngram / ngram_gpu are not supported by the v2 model runner yet
             if speculative_config.method in ("ngram", "ngram_gpu"):
                 unsupported.append("ngram/ngram_gpu speculative decoding")
+            elif (
+                speculative_config.method == "draft_model"
+                and speculative_config.disagg_draft_backend is not None
+            ):
+                pass
             elif speculative_config.method not in (
                 "eagle",
                 "eagle3",

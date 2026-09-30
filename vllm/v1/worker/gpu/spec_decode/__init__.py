@@ -8,7 +8,13 @@ from vllm.config import VllmConfig
 def init_speculator(vllm_config: VllmConfig, device: torch.device):
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
-    if speculative_config.method == "dflash":
+    if speculative_config.disagg_draft_backend is not None:
+        from vllm.v1.worker.gpu.spec_decode.remote_speculator import (
+            RemoteDraftSpeculator,
+        )
+
+        return RemoteDraftSpeculator(vllm_config, device)
+    elif speculative_config.method == "dflash":
         from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
             DFlashSpeculator,
         )

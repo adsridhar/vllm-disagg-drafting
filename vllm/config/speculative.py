@@ -293,6 +293,15 @@ class SpeculativeConfig:
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
 
+    disagg_draft_backend: Literal["stateless"] | None = None
+    """Use a separately served draft model for speculative proposals."""
+
+    disagg_draft_address: str | None = None
+    """ZeroMQ address of the stateless draft service."""
+
+    disagg_draft_timeout_ms: int = Field(default=5000, ge=1)
+    """Timeout for a remote proposal request."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -834,7 +843,9 @@ class SpeculativeConfig:
                 # detect them. When the method is explicitly "medusa", inject
                 # model_type so MedusaConfig.from_pretrained is used instead.
                 draft_hf_overrides: HfOverrides
-                if self.method == "medusa":
+                if self.disagg_draft_backend is not None:
+                    draft_hf_overrides = {}
+                elif self.method == "medusa":
                     draft_hf_overrides = {"model_type": "medusa"}
                 else:
                     # Compose any callable hf_overrides set on the target so the
@@ -881,7 +892,12 @@ class SpeculativeConfig:
                         draft_hf.truncated_vocab_size = target_vocab
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                if self.disagg_draft_backend is not None or self.method in (
+                    "eagle",
+                    "eagle3",
+                    "dflash",
+                    "dspark",
+                ):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -1313,6 +1329,20 @@ class SpeculativeConfig:
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
+        if self.disagg_draft_backend is not None:
+            if self.method != "draft_model":
+                raise ValueError("Remote drafting requires method='draft_model'.")
+            if self.disagg_draft_address is None:
+                raise ValueError(
+                    "disagg_draft_address is required for remote drafting."
+                )
+            if self.draft_sample_method != "greedy":
+                raise ValueError("Remote drafting currently requires greedy sampling.")
+        elif self.disagg_draft_address is not None:
+            raise ValueError(
+                "disagg_draft_backend is required with disagg_draft_address."
+            )
+
         if self.tensor_parallel_size is not None:
             raise ValueError(
                 "'tensor_parallel_size' is not a valid argument in the "
