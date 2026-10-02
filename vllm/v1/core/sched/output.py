@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -190,6 +190,17 @@ class ScheduledEncoderInputStats:
 
 
 @dataclass
+class ExternalDraftUpdate:
+    """Reset an existing worker request at the verified proposal endpoint."""
+
+    req_id: str
+    prompt_len: int
+    num_computed_tokens: int
+    bonus_token: int
+    sampling_params: SamplingParams
+
+
+@dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
     # We cache the request's data in each worker process, so that we don't
@@ -225,6 +236,8 @@ class SchedulerOutput:
     # list of mm_hash strings associated with the encoder outputs to be
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
+
+    external_draft_updates: list[ExternalDraftUpdate] = field(default_factory=list)
 
     scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None
 

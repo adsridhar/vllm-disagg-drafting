@@ -9,11 +9,19 @@ class ProposalRequest(msgspec.Struct):
     request_id: int
     prefix_lengths: list[int]
     num_speculative_tokens: int
+    operation: str = "propose"
+    peer_id: str = ""
+    handles: list[int] = []
+    generations: list[int] = []
+    accepted_counts: list[int] = []
+    bonus_tokens: list[int] = []
+    ipc_handles: bytes = b""
 
 
 class ProposalResponse(msgspec.Struct):
     request_id: int
     proposal_lengths: list[int]
+    generations: list[int] = []
 
 
 _request_encoder = msgspec.msgpack.Encoder()

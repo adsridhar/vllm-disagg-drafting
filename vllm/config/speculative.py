@@ -293,11 +293,11 @@ class SpeculativeConfig:
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
 
-    disagg_draft_backend: Literal["stateless"] | None = None
+    disagg_draft_backend: Literal["stateless", "resumable"] | None = None
     """Use a separately served draft model for speculative proposals."""
 
     disagg_draft_address: str | None = None
-    """ZeroMQ address of the stateless draft service."""
+    """Control address of the remote draft service."""
 
     disagg_draft_timeout_ms: int = Field(default=5000, ge=1)
     """Timeout for a remote proposal request."""

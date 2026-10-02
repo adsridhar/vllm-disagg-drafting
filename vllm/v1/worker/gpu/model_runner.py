@@ -146,6 +146,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.observability_config = vllm_config.observability_config
 
         self.device = device
+        self.external_draft_ipc: dict[str, dict[str, torch.Tensor]] = {}
+        self.external_draft_routes: dict[str, tuple[str, int, int]] = {}
         self.dtype = self.model_config.dtype
         self.kv_cache_dtype = self.dtype
         if self.cache_config.cache_dtype != "auto":
@@ -820,6 +822,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
+        self.external_draft_routes.pop(req_id, None)
         self.model_state.remove_request(req_id)
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
@@ -837,6 +840,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
         finished_req_ids = scheduler_output.finished_req_ids
+        if self.speculator is not None and hasattr(self.speculator, "finish_requests"):
+            # Includes zero-forward iterations; preemption is not completion.
+            self.speculator.finish_requests(finished_req_ids)
         if self.pooling_runner is not None:
             # Preempted docs keep their query-use reservation until rescheduled.
             self.pooling_runner.on_requests_finished(finished_req_ids)
@@ -870,6 +876,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # with the updated prompt_token_ids and mm_features.
             self._remove_request(req_id)
 
+            if new_req_data.sampling_params is not None:
+                self._set_external_draft_route(req_id, new_req_data.sampling_params)
             prompt_len = len(new_req_data.prompt_token_ids)
             sampling_params = new_req_data.sampling_params
             self.req_states.add_request(
@@ -915,7 +923,78 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.sampler is not None:
             self.sampler.apply_staged_writes()
 
+    def _set_external_draft_route(self, req_id, params) -> None:
+        route = (params.extra_args or {}).get("external_draft_ipc")
+        if route is not None:
+            self.external_draft_routes[req_id] = route
+        else:
+            self.external_draft_routes.pop(req_id, None)
+
+    def _copy_external_draft_proposals(self, input_batch: InputBatch) -> None:
+        # CPU collectors gate completion. These copies keep payloads on GPU,
+        # ordered after sampled-token writes; no proposal CPU round trip.
+        for batch_row, req_id in enumerate(input_batch.req_ids):
+            route = self.external_draft_routes.get(req_id)
+            if route is None:
+                continue
+            index = self.req_states.req_id_to_index[req_id]
+            # Ordinary synchronous drafting samples one token per completed
+            # forward. Publish once, when this step samples the final token.
+            endpoint = (
+                input_batch.num_computed_tokens_np[batch_row]
+                + input_batch.num_scheduled_tokens[batch_row]
+            )
+            if endpoint != self.req_states.max_seq_len[index] - 1:
+                continue
+            peer, slot, row = route
+            destination = self.external_draft_ipc[peer]["proposals"][slot, row]
+            start = self.req_states.prompt_len.np[index]
+            source = self.req_states.all_token_ids.gpu[
+                index, start : start + destination.numel()
+            ]
+            # History uses a CUDA view of pinned host memory. Materialize on
+            # the draft GPU before the peer copy (and match the wire dtype).
+            source = source.to(dtype=destination.dtype)
+            with torch.accelerator.device_index(destination.device.index):
+                destination.copy_(source, non_blocking=True)
+
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+        for update in scheduler_output.external_draft_updates:
+            req_index = self.req_states.req_id_to_index.get(update.req_id)
+            if req_index is None or update.req_id in (
+                scheduler_output.preempted_req_ids or ()
+            ):
+                continue
+            # A preempted request is re-added from its authoritative history.
+            if any(
+                r.req_id == update.req_id for r in scheduler_output.scheduled_new_reqs
+            ):
+                continue
+            self._set_external_draft_route(update.req_id, update.sampling_params)
+            state = self.req_states
+            state.prompt_len.np[req_index] = update.prompt_len
+            state.prefill_len.np[req_index] = update.prompt_len
+            max_tokens = update.sampling_params.max_tokens
+            assert max_tokens is not None
+            state.max_seq_len[req_index] = update.prompt_len + max_tokens
+            state.total_len.stage_write_elem(req_index, update.prompt_len)
+            state.num_computed_tokens.stage_write_elem(
+                req_index, update.num_computed_tokens
+            )
+            state.num_computed_tokens_np[req_index] = update.num_computed_tokens
+            state.all_token_ids.stage_write(
+                req_index, update.prompt_len - 1, [update.bonus_token]
+            )
+            state.last_sampled_tokens[req_index].fill_(update.bonus_token)
+            assert self.sampler is not None
+            self.sampler.add_request(
+                req_index, update.prompt_len, update.sampling_params
+            )
+        if scheduler_output.external_draft_updates:
+            self.req_states.apply_staged_writes()
+            assert self.sampler is not None
+            self.sampler.apply_staged_writes()
+
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
@@ -1589,6 +1668,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
+        if self.external_draft_routes:
+            self._copy_external_draft_proposals(input_batch)
+
         if self.speculator is not None:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
@@ -1694,8 +1776,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         free_before_shutdown(self.vllm_config)
         if hasattr(self, "model_state"):
             del self.model_state
-        if getattr(self, "speculator", None) is not None:
+        speculator = getattr(self, "speculator", None)
+        if speculator is not None:
+            if hasattr(speculator, "close"):
+                speculator.close()
             self.speculator = None
+        self.external_draft_ipc.clear()
         if hasattr(self, "model"):
             del self.model
 

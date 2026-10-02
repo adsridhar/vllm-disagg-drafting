@@ -54,6 +54,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler as V1Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
@@ -945,6 +946,11 @@ class EngineCore:
         self.model_executor.save_sharded_state(
             path=path, pattern=pattern, max_size=max_size
         )
+
+    def commit_external_verification(
+        self, commits: list[tuple[str, int, int, int, tuple[str, int, int] | None]]
+    ) -> None:
+        cast(V1Scheduler, self.scheduler).commit_external_verification(commits)
 
     def collective_rpc(
         self,

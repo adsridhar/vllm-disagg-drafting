@@ -1643,13 +1643,19 @@ class EngineArgs:
         parser.add_argument(
             "--draft-server",
             action="store_true",
-            help="Serve this model as a stateless speculative draft service.",
+            help="Serve this model as a remote speculative draft service.",
+        )
+        parser.add_argument(
+            "--draft-server-backend",
+            choices=["stateless", "resumable"],
+            default="stateless",
+            help="Draft request lifecycle backend.",
         )
         parser.add_argument(
             "--draft-server-port",
             type=int,
             default=50051,
-            help="Port for the stateless speculative draft service.",
+            help="Port for the remote speculative draft service.",
         )
 
         parser.add_argument(

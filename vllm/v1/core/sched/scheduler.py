@@ -41,6 +41,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
+    ExternalDraftUpdate,
     GrammarOutput,
     NewRequestData,
     ScheduledEncoderInputStats,
@@ -201,6 +202,7 @@ class Scheduler(SchedulerInterface):
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
         self.num_waiting_for_streaming_input: int = 0
+        self.external_draft_updates: dict[str, ExternalDraftUpdate] = {}
 
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
@@ -1206,6 +1208,7 @@ class Scheduler(SchedulerInterface):
             )
 
         scheduler_output = SchedulerOutput(
+            external_draft_updates=list(self.external_draft_updates.values()),
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -1363,6 +1366,57 @@ class Scheduler(SchedulerInterface):
         # the scheduler output.
         self.finished_req_ids = set()
         self.reset_preempted_req_ids = set()
+        self.external_draft_updates.clear()
+
+    def commit_external_verification(
+        self, commits: list[tuple[str, int, int, int, tuple[str, int, int] | None]]
+    ) -> None:
+        """Commit accepted draft tokens and resume the existing worker request."""
+        for req_id, generation, accepted, bonus, route in commits:
+            request = self.requests[req_id]
+            if (
+                not request.external_draft
+                or request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+                or generation != request.proposal_generation
+                or not 0 <= accepted <= request.num_output_tokens
+            ):
+                raise ValueError(f"Invalid external verification commit for {req_id}")
+
+        for req_id, generation, accepted, bonus, route in commits:
+            request = self.requests[req_id]
+            endpoint = request.committed_token_count + accepted
+            suffix = request._output_token_ids[:accepted] + [bonus]
+            assert request.prompt_token_ids is not None
+            request.prompt_token_ids.extend(suffix)
+            request._all_token_ids[endpoint:] = [bonus]
+            request._output_token_ids.clear()
+            request.num_prompt_tokens = endpoint + 1
+            request.committed_token_count = endpoint + 1
+            # The final proposed token is sampled but has not been forwarded.
+            request.num_computed_tokens = min(request.num_computed_tokens, endpoint)
+            del request.block_hashes[endpoint // self.hash_block_size :]
+            request.update_block_hashes()
+            request.proposal_generation += 1
+            request.stop_reason = None
+            request.spec_token_ids.clear()
+            request.num_output_placeholders = 0
+            request.is_prefill_chunk = False
+            # A paused request already reserves its capacity and worker slot.
+            request.status = RequestStatus.RUNNING
+            self.num_waiting_for_streaming_input -= 1
+            self.waiting.remove_requests([request])
+            self.skipped_waiting.remove_requests([request])
+            self.running.append(request)
+            assert request.sampling_params is not None
+            assert request.sampling_params.extra_args is not None
+            request.sampling_params.extra_args["external_draft_ipc"] = route
+            self.external_draft_updates[req_id] = ExternalDraftUpdate(
+                req_id,
+                endpoint + 1,
+                request.num_computed_tokens,
+                bonus,
+                request.sampling_params,
+            )
 
     def _update_request_as_session(
         self, session: Request, update: StreamingUpdate

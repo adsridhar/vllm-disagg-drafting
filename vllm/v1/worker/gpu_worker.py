@@ -1007,6 +1007,23 @@ class Worker(WorkerBase):
             )
         return self.profiler.annotate_context_manager(annotation)
 
+    def attach_remote_draft_ipc(self, peer_id: str, handles: bytes) -> None:
+        from vllm.v1.spec_decode.remote_ipc import attach_draft_ipc
+
+        attach_draft_ipc(self, peer_id, handles)
+
+    def detach_remote_draft_ipc(self, peer_id: str) -> None:
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+        assert isinstance(self.model_runner, GPUModelRunner)
+        buffers = self.model_runner.external_draft_ipc.pop(peer_id)
+        torch.cuda.current_stream(buffers["proposals"].device).synchronize()
+
+    def publish_remote_draft_ipc(self, peer_id: str, slot: int, sequence: int) -> None:
+        from vllm.v1.spec_decode.remote_ipc import publish_draft_ipc
+
+        publish_draft_ipc(self, peer_id, slot, sequence)
+
     @torch.inference_mode()
     @with_gpu_sync_check
     def sample_tokens(

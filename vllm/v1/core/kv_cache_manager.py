@@ -558,7 +558,9 @@ class KVCacheManager:
         # "finalized" tokens are cached.
         num_tokens_to_cache = min(
             total_computed_tokens + num_new_tokens,
-            request.num_tokens,
+            request.committed_token_count
+            if request.external_draft
+            else request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
@@ -766,6 +768,10 @@ class KVCacheManager:
                 that are already cached and tokens to be cached.
         """
         if self.enable_caching:
+            if request.external_draft:
+                num_computed_tokens = min(
+                    num_computed_tokens, request.committed_token_count
+                )
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(

@@ -214,6 +214,11 @@ class Request:
 
         # Used for streaming
         self.resumable = resumable
+        # External proposals are private until target verification commits them.
+        extra_args = sampling_params.extra_args if sampling_params else None
+        self.external_draft = bool(extra_args and extra_args.get("external_draft"))
+        self.committed_token_count = self.num_prompt_tokens
+        self.proposal_generation = 0
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
 

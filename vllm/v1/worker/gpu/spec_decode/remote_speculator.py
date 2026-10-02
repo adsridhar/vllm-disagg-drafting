@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Any
 
 import torch
@@ -11,14 +12,17 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tp_group,
 )
-from vllm.v1.spec_decode.remote_connector import RemoteDraftConnector
+from vllm.v1.spec_decode.remote_connector import (
+    RemoteDraftConnector,
+    ResumableDraftConnector,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.speculator import BaseSpeculator
 from vllm.v1.worker.gpu.states import RequestState
 
 
 class RemoteDraftSpeculator(BaseSpeculator):
-    """Uses a separate vLLM server to produce stateless draft tokens."""
+    """Uses a separate vLLM server to produce speculative draft tokens."""
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         config = vllm_config.speculative_config
@@ -31,13 +35,96 @@ class RemoteDraftSpeculator(BaseSpeculator):
         self.supports_mm_inputs = False
         self.draft_logits = None
         self.req_states: RequestState | None = None
+        self.backend = config.disagg_draft_backend
+        self.handles: dict[str, int] = {}
+        self.next_handle = 0
+        connector_type = (
+            ResumableDraftConnector
+            if self.backend == "resumable"
+            else RemoteDraftConnector
+        )
         self.connector = (
-            RemoteDraftConnector(
-                config.disagg_draft_address, config.disagg_draft_timeout_ms
-            )
+            connector_type(config.disagg_draft_address, config.disagg_draft_timeout_ms)
             if get_tensor_model_parallel_rank() == 0
             else None
         )
+
+        if (
+            isinstance(self.connector, ResumableDraftConnector)
+            and os.environ.get("VLLM_DISAGG_TRANSPORT", "cuda_ipc") == "cuda_ipc"
+        ):
+            self.connector.establish_ipc(
+                device,
+                vllm_config.scheduler_config.max_num_seqs,
+                self.num_speculative_tokens,
+            )
+
+    def finish_requests(self, req_ids: set[str]) -> None:
+        if isinstance(self.connector, ResumableDraftConnector):
+            handles = [self.handles.pop(r) for r in req_ids if r in self.handles]
+            self.connector.close_requests(handles)
+
+    def _propose_resumable(
+        self,
+        input_batch,
+        req_indices,
+        lengths,
+        active_rows,
+        num_sampled,
+        last_sampled,
+        proposals,
+    ) -> None:
+        assert isinstance(self.connector, ResumableDraftConnector)
+        assert self.req_states is not None
+        opening = [r for r in active_rows if input_batch.req_ids[r] not in self.handles]
+        committing = [r for r in active_rows if input_batch.req_ids[r] in self.handles]
+        pending = None
+        commit_handles = [self.handles[input_batch.req_ids[r]] for r in committing]
+        # Sample counts use batch rows; last_sampled uses persistent worker slots.
+        commit_indices = [req_indices[r] for r in committing]
+        if committing and self.connector.ring is not None:
+            pending = self.connector.dispatch(
+                commit_handles,
+                num_sampled[committing].to(torch.int64) - 1,
+                last_sampled[commit_indices].reshape(-1).to(torch.int64),
+            )
+        if opening:
+            indices = [req_indices[r] for r in opening]
+            max_length = max(lengths[r] for r in opening)
+            token_matrix = self.req_states.all_token_ids.gpu[indices, :max_length].cpu()
+            prefixes = [
+                tokens[: lengths[r]].tolist()
+                for tokens, r in zip(token_matrix, opening)
+            ]
+            handles = []
+            for row in opening:
+                self.handles[input_batch.req_ids[row]] = self.next_handle
+                handles.append(self.next_handle)
+                self.next_handle += 1
+            result = self.connector.open_requests(
+                handles, prefixes, self.num_speculative_tokens
+            )
+            proposals[opening] = torch.tensor(
+                result, device=self.device, dtype=torch.int64
+            )
+        if committing:
+            if pending is not None:
+                result = self.connector.await_proposals(commit_handles, pending)
+            else:
+                result = torch.tensor(
+                    self.connector.commit_and_propose(
+                        commit_handles,
+                        (num_sampled[committing].cpu() - 1).tolist(),
+                        last_sampled[commit_indices].reshape(-1).cpu().tolist(),
+                    ),
+                    device=self.device,
+                    dtype=torch.int64,
+                )
+            proposals[committing] = result
+
+    def close(self) -> None:
+        if self.connector is not None:
+            self.connector.close()
 
     def bind_request_state(self, req_states: RequestState) -> None:
         self.req_states = req_states
@@ -91,7 +178,24 @@ class RemoteDraftSpeculator(BaseSpeculator):
                 and length + self.num_speculative_tokens
                 <= min(self.req_states.max_seq_len[index], self.draft_max_model_len)
             ]
-            if active_rows:
+            if self.backend == "resumable":
+                self.finish_requests(
+                    {
+                        input_batch.req_ids[r]
+                        for r, sampled in enumerate(sampled_counts)
+                        if sampled > 0 and r not in active_rows
+                    }
+                )
+                self._propose_resumable(
+                    input_batch,
+                    req_indices,
+                    lengths,
+                    active_rows,
+                    num_sampled,
+                    last_sampled,
+                    proposals,
+                )
+            elif active_rows:
                 active_indices = [req_indices[row] for row in active_rows]
                 max_prefix_len = max(lengths[row] for row in active_rows)
                 prefix_matrix = self.req_states.all_token_ids.gpu[
